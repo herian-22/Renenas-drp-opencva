@@ -199,7 +199,10 @@ gboolean update_gui_image(gpointer user_data) {
 
 // --- DRP PROCESS ---
 void drpThread() {
-    int frames = 0; auto start = chrono::steady_clock::now();
+    setThreadPriority(99); 
+
+    int frames = 0; 
+    auto start = chrono::steady_clock::now();
     while(isRunning) {
         int idx_in = -1;
         { unique_lock<mutex> lock(mtxData); cv_drp.wait(lock, []{ return inputPool[r_idx_drp].ready || !isRunning; }); if(!isRunning) break; idx_in = r_idx_drp; inputPool[idx_in].ready = false; }
@@ -248,6 +251,15 @@ extern "C" {
             last_mouse_x = e->x; last_mouse_y = e->y; 
         } 
         return TRUE; 
+    }
+}
+void setThreadPriority(int priority) {
+    sched_param sch_params;
+    sch_params.sched_priority = priority;
+    if(pthread_setschedparam(pthread_self(), SCHED_FIFO, &sch_params)) {
+        cerr << "[WARN] Failed to set Thread Priority. Run with sudo?" << endl;
+    } else {
+        cout << "[SYS] Thread Priority set to Real-Time: " << priority << endl;
     }
 }
 
