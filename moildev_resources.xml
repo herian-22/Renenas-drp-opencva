@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/moildev/app">
+    <file compressed="true" alias="gui.glade">asset/gui.glade</file>
+  </gresource>
+</gresources>

@@ -1,7 +1,6 @@
 /**
- * DRP GUI CONTROLLER - SPEED DIAGNOSTIC MODE
- * * FORCE 30 FPS TARGET
- * * MENAMPILKAN WAKTU PROSES PER-BLOCK (Capture vs Remap)
+ * DRP GUI CONTROLLER - EMBEDDED RESOURCE VERSION
+ * Revised for Stability: 1080p Resolution & Resource Loading
  */
 
 #include <gtk/gtk.h>
@@ -17,20 +16,24 @@
 #include <dlfcn.h>
 #include <unistd.h>
 #include <pthread.h>
-#include <chrono> // Untuk Timer Presisi
+#include <chrono> 
 #include "dmabuf.h" 
 
+// --- [PENTING] Header Resource Hasil Generate CMake ---
+extern "C" {
+#include "moildev_resources.h" 
+}
 using namespace cv;
 using namespace std;
 
-// === KONFIGURASI TARGET ===
-const int PROC_W = 640;   
-const int PROC_H = 480;
-// Coba turunkan sedikit jika masih lag, misal: 1024 x 768
-int OUT_W  = 1408; 
-int OUT_H  = 1056;
+// === KONFIGURASI RESOLUSI (SAFE SPOT: 1080p) ===
+// Kita gunakan 1080p agar CPU lancar men-decode MJPEG, dan DRP ringan meremap.
+const int PROC_W = 1280;   
+const int PROC_H = 960;
+int OUT_W  = 1280; 
+int OUT_H  = 960;
 
-// Fisheye Params
+// Fisheye Params (Sesuaikan jika perlu)
 const double PARA[] = {0.0, 0.0, -35.475, 73.455, -41.392, 499.33};
 const double ORG_W = 2592.0, ORG_H = 1944.0; 
 const double ORG_ICX = 1205.0, ORG_ICY = 966.0;
@@ -52,7 +55,7 @@ atomic<bool> ui_update_pending(false);
 GtkWidget *main_window;
 GtkWidget *img_display;
 
-// Buffers
+// Buffers (Menggunakan 3 Buffer agar smooth)
 struct FrameBuffer { Mat data; dma_buffer dbuf; bool ready; };
 const int BUFFER_SIZE = 3; 
 vector<FrameBuffer> inputPool(BUFFER_SIZE);
@@ -69,7 +72,7 @@ string stats_log = "Init...";
 void allocateDRPBuffer(FrameBuffer &fb, int width, int height, int type) {
     size_t size = width * height * CV_ELEM_SIZE(type);
     if (buffer_alloc_dmabuf(&fb.dbuf, size) != 0) { 
-        cerr << "[DMABUF] ERROR: Alloc Fail!" << endl; 
+        cerr << "[DMABUF] ERROR: Alloc Fail! (Check CMA Size)" << endl; 
         exit(1); 
     }
     fb.data = Mat(height, width, type, fb.dbuf.mem); 
@@ -191,26 +194,35 @@ void mapUpdateThread() {
     }
 }
 
-// --- THREAD CAPTURE (OPTIMIZED PIPELINE + TIMER) ---
+// --- THREAD CAPTURE ---
 void captureThread(string src) {
     string pipe;
     bool is_camera = isdigit(src[0]);
 
-    // PIPELINE OPTIMIZATION:
-    // Coba paksa MJPG jika kamera, ini jauh lebih ringan daripada Raw YUYV di 640x480
+    // PIPELINE OPTIMIZATION 1080p
+    // Menggunakan jpegdec (Software MJPEG) karena v4l2jpegdec (Hardware) tidak tersedia
     if(is_camera) {
-        pipe = "v4l2src device=/dev/video" + src + " ! image/jpeg, width=640, height=480, framerate=30/1 ! jpegdec ! videoconvert ! video/x-raw, format=BGR ! appsink drop=true sync=false";
+        pipe = "v4l2src device=/dev/video" + src + " ! image/jpeg, width=1280, height=960, framerate=30/1 ! jpegdec ! videoconvert ! video/x-raw, format=BGR ! appsink drop=true sync=false";
     } else {
-        pipe = "filesrc location=" + src + " ! decodebin ! videoconvert ! video/x-raw, format=BGR ! videoscale ! video/x-raw, width=640, height=480 ! appsink drop=true sync=false";
+        // pipe = "filesrc location=" + src + " ! decodebin ! videoconvert ! video/x-raw, format=BGR ! videoscale ! video/x-raw, width=1280, height=960 ! appsink drop=true sync=false";
+        pipe = "filesrc location=" + src +
+                " ! decodebin"
+                " ! videorate"
+                " ! videoconvert"
+                " ! video/x-raw,format=BGR,framerate=30/1"
+                " ! videoscale"
+                " ! video/x-raw,width=1280,height=960"
+                " ! appsink max-buffers=1 drop=true sync=false";
+
     }
 
     VideoCapture *cap = new VideoCapture(pipe, CAP_GSTREAMER);
 
-    // Fallback jika MJPG gagal, coba RAW biasa
     if (!cap->isOpened() && is_camera) {
         cerr << "[CAPTURE] MJPG Failed, trying RAW..." << endl;
         delete cap;
-        pipe = "v4l2src device=/dev/video" + src + " ! video/x-raw, width=640, height=480, framerate=30/1 ! queue ! videoconvert ! video/x-raw, format=BGR ! appsink drop=true sync=false";
+        // Fallback pipeline (slow but works)
+        pipe = "v4l2src device=/dev/video" + src + " ! video/x-raw, width=640, height=480 ! videoconvert ! video/x-raw, format=BGR ! appsink drop=true sync=false";
         cap = new VideoCapture(pipe, CAP_GSTREAMER);
     }
 
@@ -227,30 +239,24 @@ void captureThread(string src) {
 
     while(isRunning) {
         next_frame += frame_duration;
-
-        // UKUR WAKTU BACA KAMERA
-        auto t1 = chrono::steady_clock::now();
-        bool success = cap->read(temp);
-        auto t2 = chrono::steady_clock::now();
-        double cap_ms = chrono::duration_cast<chrono::milliseconds>(t2 - t1).count();
-
-        // Jika baca kamera > 40ms, berarti masalah di kamera/cahaya
-        if (cap_ms > 40) {
-            // Uncomment ini untuk debug kamera:
-            // printf("[WARN] Slow Camera: %.1f ms\n", cap_ms);
-        }
-
-        if(!success || temp.empty()) {
-            if(!is_camera) {
-                delete cap; cap = nullptr; cap = new VideoCapture(pipe, CAP_GSTREAMER);
-            } else {
-                delete cap; this_thread::sleep_for(chrono::milliseconds(500)); cap = new VideoCapture(pipe, CAP_GSTREAMER);
-            }
-            continue;
+        
+        if (!cap->read(temp) || temp.empty()) {
+             if(is_camera) {
+                 // Auto-reconnect camera
+                 delete cap; this_thread::sleep_for(chrono::milliseconds(500)); 
+                 cap = new VideoCapture(pipe, CAP_GSTREAMER);
+             }
+             continue;
         }
 
         int idx = w_idx_cap;
-        temp.copyTo(inputPool[idx].data); 
+        // Resize jika input fallback (640x480) tidak sama dengan PROC_W (1920)
+        if (temp.cols != PROC_W || temp.rows != PROC_H) {
+            cv::resize(temp, inputPool[idx].data, Size(PROC_W, PROC_H));
+        } else {
+            temp.copyTo(inputPool[idx].data);
+        }
+
         buffer_flush_dmabuf(inputPool[idx].dbuf.idx, inputPool[idx].dbuf.size);
         
         { lock_guard<mutex> lock(mtxData); inputPool[idx].ready = true; w_idx_cap = (w_idx_cap + 1) % BUFFER_SIZE; r_idx_drp = idx; }
@@ -279,13 +285,20 @@ gboolean update_gui_image(gpointer user_data) {
     int idx = (int)(intptr_t)user_data;
     if(idx < 0 || idx >= BUFFER_SIZE) { ui_update_pending = false; return FALSE; }
     Mat &src = outputPool[idx].data;
+    // Konversi Mat ke Pixbuf untuk ditampilkan di GTK
     GdkPixbuf *pixbuf = gdk_pixbuf_new_from_data(src.data, GDK_COLORSPACE_RGB, FALSE, 8, src.cols, src.rows, src.step, NULL, NULL);
-    if (pixbuf) { gtk_image_set_from_pixbuf(GTK_IMAGE(img_display), pixbuf); g_object_unref(pixbuf); }
+    if (pixbuf) { 
+        // Resize agar pas di layar laptop jika outputnya besar
+        GdkPixbuf *scaled = gdk_pixbuf_scale_simple(pixbuf, 1280, 720, GDK_INTERP_BILINEAR);
+        gtk_image_set_from_pixbuf(GTK_IMAGE(img_display), scaled); 
+        g_object_unref(scaled);
+        g_object_unref(pixbuf); 
+    }
     outputPool[idx].ready = false; ui_update_pending = false; 
     return FALSE;
 }
 
-// --- THREAD DRP (DIAGNOSTIC) ---
+// --- THREAD DRP (PROCESSING) ---
 void drpThread() {
     int frames = 0; 
     auto start = chrono::steady_clock::now();
@@ -298,18 +311,13 @@ void drpThread() {
         int idx_out = w_idx_drp;
         int map_idx = active_map_idx.load();
         
-        // !!! KUNCI PERFORMANCE !!!
-        // INTER_NEAREST = Sangat Cepat, Sedikit Kasar
-        // INTER_LINEAR = Halus, tapi Berat.
-        // Kita paksa NEAREST dulu untuk memastikan 30 FPS.
-        int interp = INTER_NEAREST; 
+        int interp = INTER_NEAREST; // Tercepat
         
-        // --- UKUR WAKTU REMAP ---
         auto t1 = chrono::steady_clock::now();
+        // Proses Remap di Hardware DRP
         cv::remap(inputPool[idx_in].data, outputPool[idx_out].data, map1_bufs[map_idx].data, map2_bufs[map_idx].data, interp, BORDER_CONSTANT);
         auto t2 = chrono::steady_clock::now();
         double remap_ms = chrono::duration_cast<chrono::milliseconds>(t2 - t1).count();
-        // ------------------------
 
         cv::cvtColor(outputPool[idx_out].data, outputPool[idx_out].data, COLOR_BGR2RGB);
 
@@ -319,13 +327,10 @@ void drpThread() {
             double total_ms = chrono::duration_cast<chrono::milliseconds>(now - start).count();
             double fps = 30000.0 / (total_ms + 1.0); start = now;
             stats_log = "FPS: " + to_string((int)fps);
-            
-            // LOG DIAGNOSTIC
-            // Jika Remap > 30ms, berarti Hardware DRP keberatan beban (Resolusi ketinggian)
-            printf("[DIAG] FPS: %d | Remap Time: %.1f ms | Resolution: %dx%d\n", (int)fps, remap_ms, OUT_W, OUT_H);
+            printf("[DIAG] FPS: %d | Remap Time: %.1f ms | Res: %dx%d\n", (int)fps, remap_ms, OUT_W, OUT_H);
         }
         
-        putText(outputPool[idx_out].data, stats_log, Point(20, 40), FONT_HERSHEY_SIMPLEX, 0.8, Scalar(0, 255, 0), 2);
+        putText(outputPool[idx_out].data, stats_log, Point(20, 40), FONT_HERSHEY_SIMPLEX, 1.0, Scalar(0, 255, 0), 2);
         buffer_flush_dmabuf(outputPool[idx_out].dbuf.idx, outputPool[idx_out].dbuf.size);
         
         { lock_guard<mutex> lock(mtxData); outputPool[idx_out].ready = true; w_idx_drp = (w_idx_drp + 1) % BUFFER_SIZE; 
@@ -333,24 +338,46 @@ void drpThread() {
     }
 }
 
+// --- MAIN FUNCTION (RESOURCE FIXED) ---
 int main(int argc, char** argv) {
     putenv((char*)"GST_DEBUG=1");
+    
+    // [PENTING] Init Resource agar tidak dibuang oleh linker
+    moildev_app_get_resource();
+
     if(argc < 2) { cout << "./app <video_id>" << endl; return -1; }
+    
     gtk_init(&argc, &argv);
     GtkBuilder *builder = gtk_builder_new();
-    if (!gtk_builder_add_from_file(builder, "gui.glade", NULL)) return 1;
+    GError *error = NULL;
+
+    // [PENTING] Memuat UI dari Resource Memory (bukan file)
+    if (!gtk_builder_add_from_resource(builder, "/moildev/app/gui.glade", &error)) {
+        g_printerr("Error loading UI resource: %s\n", error->message);
+        g_clear_error(&error);
+        return 1;
+    }
+
     main_window = GTK_WIDGET(gtk_builder_get_object(builder, "main_window"));
     img_display = GTK_WIDGET(gtk_builder_get_object(builder, "img_display"));
     gtk_window_fullscreen(GTK_WINDOW(main_window));
     gtk_builder_connect_signals(builder, NULL);
     g_signal_connect(main_window, "key-press-event", G_CALLBACK(on_key_press), NULL);
     g_object_unref(builder);
+
     unsetenv("LD_LIBRARY_PATH"); initDRP();
+    
+    // Alokasi Buffer Memory
     for(int i=0; i<BUFFER_SIZE; i++) { allocateDRPBuffer(inputPool[i], PROC_W, PROC_H, CV_8UC3); allocateDRPBuffer(outputPool[i], OUT_W, OUT_H, CV_8UC3); }
     for(int i=0; i<MAP_BUFFER_COUNT; i++) { allocateDRPBuffer(map1_bufs[i], OUT_W, OUT_H, CV_16SC2); allocateDRPBuffer(map2_bufs[i], OUT_W, OUT_H, CV_16UC1); }
-    thread t1(captureThread, argv[1]); thread t2(mapUpdateThread); thread t3(drpThread);
+    
+    thread t1(captureThread, argv[1]); 
+    thread t2(mapUpdateThread); 
+    thread t3(drpThread);
+    
     gtk_widget_show_all(main_window);
     gtk_main();
+    
     isRunning = false; cv_drp.notify_all(); t1.join(); t2.join(); t3.join();
     return 0;
 }
