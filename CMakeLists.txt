@@ -5,9 +5,15 @@ project(moildev_app+yolo CXX C)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Flag Optimasi (Penting untuk performa DRP)
-add_compile_options(-O3 -pthread -fPIC)
-set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -rdynamic")
+# Flag Optimasi & OpenMP (Manual Force)
+# Kita tambahkan -fopenmp di sini agar tidak perlu find_package yang sering gagal di Cross-Compile
+add_compile_options(-O3 -pthread -fPIC -fopenmp)
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -rdynamic -fopenmp")
+
+# === FIX: MANUAL INCLUDE OPENMP (POKY SDK) ===
+# Compiler tidak otomatis menemukan omp.h, jadi kita tambahkan manual path-nya.
+# Path ini diambil dari hasil 'find' Anda: /opt/poky/.../include/omp.h
+include_directories("/opt/poky/3.1.31/sysroots/aarch64-poky-linux/usr/lib64/aarch64-poky-linux/8.3.0/include")
 
 # ==========================================
 # 1. KONFIGURASI TVM & DRP-AI (BARU)
@@ -38,6 +44,8 @@ endif()
 
 # --- Cari Paket ---
 find_package(PkgConfig REQUIRED)
+# HAPUS/COMMENT: find_package(OpenMP) sering gagal di sysroot. Kita sudah paksa flag di atas.
+# find_package(OpenMP REQUIRED COMPONENTS CXX) 
 pkg_check_modules(OPENCV REQUIRED opencv4)
 pkg_check_modules(GTK3 REQUIRED gtk+-3.0)
 
@@ -102,6 +110,11 @@ add_executable(moildev_app+DrpAiYolo
     # File Resource GUI
     ${GRESOURCE_C} 
 )
+
+# Tidak perlu target_link_libraries OpenMP::OpenMP_CXX karena sudah di-set di CMAKE_EXE_LINKER_FLAGS
+# if(OpenMP_CXX_FOUND)
+#    target_link_libraries(moildev_app+DrpAiYolo PUBLIC OpenMP::OpenMP_CXX)
+# endif()
 
 # ==========================================
 # 5. LINKING LIBRARIES (GABUNGAN)

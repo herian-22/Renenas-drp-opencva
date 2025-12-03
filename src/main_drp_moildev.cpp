@@ -12,13 +12,16 @@
 #include <fcntl.h>
 #include <chrono> 
 #include <sys/ioctl.h>
+#include <sys/mman.h> 
 #include <linux/drpai.h>
 #include <fstream> 
+#include <signal.h>
 
 #include "dmabuf.h" 
 #include "drpai_yolo.h" 
 #include "box.h"
 #include "define.h"
+
 
 extern "C" {
 #include "moildev_resources.h" 
@@ -56,28 +59,21 @@ atomic<ViewMode> current_mode(MODE_MAIN);
 atomic<int> active_map_idx(0);
 
 // --- VARIABEL PTZ & CONFIG ---
-
-// 1. Single View
 atomic<float> cur_alpha(0.0f), cur_beta(0.0f), cur_zoom(2.0f);
 atomic<bool> cur_flip_h(false), cur_flip_v(false);
 
-// 2. Panorama 
 atomic<float> pano_alpha(110.0f), pano_beta(0.0f), pano_zoom(1.0f);
 atomic<bool> pano_flip_h(false), pano_flip_v(false);
 
-// 3. Multi View (Anypoint 1, 2, 3)
-atomic<float> view1_alpha(-45.0f), view1_beta(0.0f), view1_zoom(3.5f); // Kiri
+atomic<float> view1_alpha(-45.0f), view1_beta(0.0f), view1_zoom(3.5f); 
 atomic<bool>  view1_flip_h(false), view1_flip_v(false);
 
-atomic<float> view2_alpha(0.0f),   view2_beta(0.0f), view2_zoom(3.5f); // Tengah
+atomic<float> view2_alpha(0.0f),   view2_beta(0.0f), view2_zoom(3.5f);
 atomic<bool>  view2_flip_h(false), view2_flip_v(false);
 
-atomic<float> view3_alpha(45.0f),  view3_beta(0.0f), view3_zoom(3.5f); // Kanan
+atomic<float> view3_alpha(45.0f),  view3_beta(0.0f), view3_zoom(3.5f);
 atomic<bool>  view3_flip_h(false), view3_flip_v(false);
 
-// ID View Aktif: 
-// 0=View1, 1=View2, 2=View3
-// 3=Panorama (Saat di Mode Main bagian atas diklik)
 atomic<int> active_view_id(0); 
 
 atomic<bool> isRunning(true);
@@ -95,10 +91,19 @@ atomic<double> stats_remap_ms(0.0);
 atomic<double> stats_fps(0.0);
 
 // Buffers
-struct FrameBuffer { Mat data; dma_buffer dbuf; bool ready; };
+// BUFFER_SIZE = 3 untuk Double buffering yang aman
 int BUFFER_SIZE = 3; 
-vector<FrameBuffer> inputPool;
+
+// Input Pool: YUYV (2 Channel) dari Kamera
+struct FrameBuffer { Mat data; dma_buffer dbuf; bool ready; };
+vector<FrameBuffer> inputPool; // YUYV RAW
+
+// Process Pool: BGR (3 Channel) hasil konversi OCA untuk AI & Remap
+vector<FrameBuffer> processPool; 
+
+// Output Pool: BGR (3 Channel) hasil Remap untuk Display
 vector<FrameBuffer> outputPool;
+
 const int MAP_BUFFER_COUNT = 2;
 FrameBuffer map1_bufs[MAP_BUFFER_COUNT], map2_bufs[MAP_BUFFER_COUNT];
 
@@ -130,16 +135,52 @@ void allocateDRPBuffer(FrameBuffer &fb, int width, int height, int type) {
     fb.ready = false;
 }
 
+void freeDRPBuffer(FrameBuffer &fb) {
+    if (fb.dbuf.mem) {
+        munmap(fb.dbuf.mem, fb.dbuf.size);
+        fb.dbuf.mem = nullptr;
+    }
+}
+
+void cleanup_resources() {
+    cout << "\n[CLEANUP] Releasing DMA Buffers..." << endl;
+    for(int i=0; i<inputPool.size(); i++) freeDRPBuffer(inputPool[i]);
+    for(int i=0; i<processPool.size(); i++) freeDRPBuffer(processPool[i]); // Clean process pool
+    for(int i=0; i<outputPool.size(); i++) freeDRPBuffer(outputPool[i]);
+    for(int i=0; i<MAP_BUFFER_COUNT; i++) {
+        freeDRPBuffer(map1_bufs[i]);
+        freeDRPBuffer(map2_bufs[i]);
+    }
+    cout << "[CLEANUP] Done." << endl;
+}
+
+void signal_handler(int signum) {
+    cout << "\n[SIGNAL] Caught Ctrl+C. Exiting..." << endl;
+    isRunning = false;
+    cv_drp.notify_all();
+    gtk_main_quit();
+}
+
+// === AKTIVASI DRP-OCA (OPENCV ACCELERATOR) ===
 void* lib_handle = nullptr;
 typedef int (*OCA_Activate_Func)(unsigned long*);
 void initDRP() {
     char cwd[PATH_MAX]; 
     if(getcwd(cwd, sizeof(cwd)) != NULL) setenv("DRP_EXE_PATH", cwd, 1);
+    // Load library OCA Renesas
     lib_handle = dlopen("/usr/lib/aarch64-linux-gnu/renesas/libopencv_imgproc.so.4.1.0", RTLD_NOW | RTLD_GLOBAL | RTLD_NODELETE);
-    if (!lib_handle) exit(1);
+    if (!lib_handle) {
+        cerr << "[ERROR] Failed to load libopencv_imgproc.so (OCA)! Check SDK." << endl;
+        exit(1);
+    }
     OCA_Activate_Func OCA_Activate_Ptr = (OCA_Activate_Func)dlsym(lib_handle, "_Z12OCA_ActivatePm");
-    unsigned long OCA_list[17] = {0}; OCA_list[0]=1; OCA_list[16]=1;
-    OCA_Activate_Ptr(OCA_list);
+    if (OCA_Activate_Ptr) {
+        unsigned long OCA_list[17] = {0}; OCA_list[0]=1; OCA_list[16]=1;
+        OCA_Activate_Ptr(OCA_list);
+        cout << "[INIT] DRP-OCA Activated! cv::cvt & cv::remap will be HW Accelerated." << endl;
+    } else {
+        cerr << "[ERROR] OCA_Activate symbol not found!" << endl;
+    }
 }
 
 // === FILE I/O ===
@@ -154,9 +195,7 @@ void saveConfig() {
         file << "PANO " << pano_alpha << " " << pano_beta << " " << pano_zoom << " " << pano_flip_h << " " << pano_flip_v << endl;
         file << "SINGLE " << cur_alpha << " " << cur_beta << " " << cur_zoom << " " << cur_flip_h << " " << cur_flip_v << endl;
         file.close();
-        cout << "[CONFIG] Configuration SAVED to " << CONFIG_FILE << endl;
-    } else {
-        cerr << "[CONFIG] Error saving config file!" << endl;
+        cout << "[CONFIG] Configuration SAVED." << endl;
     }
 }
 
@@ -174,9 +213,6 @@ void loadConfig() {
             else if (key == "SINGLE") { cur_alpha=a; cur_beta=b; cur_zoom=z; cur_flip_h=fh; cur_flip_v=fv; }
         }
         file.close();
-        cout << "[CONFIG] Configuration LOADED from " << CONFIG_FILE << endl;
-    } else {
-        cout << "[CONFIG] No config file found. Using defaults." << endl;
     }
 }
 
@@ -212,7 +248,6 @@ public:
                     rho=getRho(atan2(sqrt(x2*x2+y2*y2),z2)); theta=atan2(y2,x2);
                 }
 
-                // Logic Flip
                 int target_x = flip_h ? (r.width - 1 - x) : x;
                 int target_y = flip_v ? (r.height - 1 - y) : y;
                 int py = r.y + target_y;
@@ -241,6 +276,8 @@ public:
 };
 
 void mapUpdateThread() {
+    this_thread::sleep_for(chrono::milliseconds(800));
+
     MoilNative moil;
     Mat mx(OUT_H, OUT_W, CV_32F);
     Mat my(OUT_H, OUT_W, CV_32F);
@@ -267,7 +304,6 @@ void mapUpdateThread() {
             if(pano_alpha!=l_pa || pano_beta!=l_pb || pano_flip_h!=l_pfh || pano_flip_v!=l_pfv) changed = true;
         }
         else if (mode == MODE_MAIN) {
-            // Cek 3 View + Pano
             if(view1_alpha!=l_v1a || view1_beta!=l_v1b || view1_zoom!=l_v1z || view1_flip_h!=l_v1fh || view1_flip_v!=l_v1fv ||
                view2_alpha!=l_v2a || view2_beta!=l_v2b || view2_zoom!=l_v2z || view2_flip_h!=l_v2fh || view2_flip_v!=l_v2fv ||
                view3_alpha!=l_v3a || view3_beta!=l_v3b || view3_zoom!=l_v3z || view3_flip_h!=l_v3fh || view3_flip_v!=l_v3fv ||
@@ -289,30 +325,19 @@ void mapUpdateThread() {
 
         switch(mode) {
             case MODE_MAIN: {
-                // Layout: Atas Pano, Bawah 3 Anypoint
                 int split_y = OUT_H / 2;
-                int third_w = OUT_W / 3; // Bagi lebar jadi 3
-
-                // Pano Atas
+                int third_w = OUT_W / 3;
                 moil.fillRegion(mx, my, Rect(0, 0, OUT_W, split_y), pano_alpha.load(), pano_beta.load(), 0, true, pano_flip_h, pano_flip_v);
-                
-                // View 1 (Kiri Bawah)
                 moil.fillRegion(mx, my, Rect(0, split_y, third_w, split_y), view1_alpha, view1_beta, view1_zoom, false, view1_flip_h, view1_flip_v);
-                
-                // View 2 (Tengah Bawah)
                 moil.fillRegion(mx, my, Rect(third_w, split_y, third_w, split_y), view2_alpha, view2_beta, view2_zoom, false, view2_flip_h, view2_flip_v);
-                
-                // View 3 (Kanan Bawah) - Baru
                 moil.fillRegion(mx, my, Rect(2*third_w, split_y, third_w, split_y), view3_alpha, view3_beta, view3_zoom, false, view3_flip_h, view3_flip_v);
-
-                // Update Cache
+                
                 l_v1a = view1_alpha; l_v1b = view1_beta; l_v1z = view1_zoom; l_v1fh = view1_flip_h; l_v1fv = view1_flip_v;
                 l_v2a = view2_alpha; l_v2b = view2_beta; l_v2z = view2_zoom; l_v2fh = view2_flip_h; l_v2fv = view2_flip_v;
                 l_v3a = view3_alpha; l_v3b = view3_beta; l_v3z = view3_zoom; l_v3fh = view3_flip_h; l_v3fv = view3_flip_v;
                 l_pa = pano_alpha; l_pb = pano_beta; l_pfh = pano_flip_h; l_pfv = pano_flip_v;
                 break;
             }
-
             case MODE_TRIPLE: {
                 int split_w = OUT_W / 3; 
                 moil.fillRegion(mx, my, Rect(0, 0, split_w, OUT_H), view1_alpha, view1_beta, view1_zoom, false, view1_flip_h, view1_flip_v);
@@ -324,17 +349,14 @@ void mapUpdateThread() {
                 l_v3a = view3_alpha; l_v3b = view3_beta; l_v3z = view3_zoom; l_v3fh = view3_flip_h; l_v3fv = view3_flip_v;
                 break;
             }
-
             case MODE_ORIGINAL: 
                 moil.fillStandard(mx, my, Rect(0, 0, OUT_W, OUT_H)); 
                 break;
-
             case MODE_PANORAMA: {
                 moil.fillRegion(mx, my, Rect(0, 0, OUT_W, OUT_H), pano_alpha.load(), pano_beta.load(), 0, true, pano_flip_h, pano_flip_v);
                 l_pa = pano_alpha; l_pb = pano_beta; l_pfh = pano_flip_h; l_pfv = pano_flip_v;
                 break;
             }
-
             case MODE_GRID: {
                 int bw = OUT_W/2, bh = OUT_H/2;
                 moil.fillRegion(mx, my, Rect(0, 0, bw, bh), 0, 0, 2.0, false, false, false);
@@ -343,7 +365,6 @@ void mapUpdateThread() {
                 moil.fillRegion(mx, my, Rect(bw, bh, bw, bh), 45, 90, 2.0, false, false, false);
                 break;
             }
-
             case MODE_SINGLE: {
                 int scale = 4; int sw = OUT_W / scale; int sh = OUT_H / scale;
                 Mat smx(sh, sw, CV_32F); Mat smy(sh, sw, CV_32F);
@@ -367,31 +388,125 @@ void mapUpdateThread() {
     }
 }
 
-void captureThread(string src) {
-    string pipe;
+// Helper: Cari bounding box lurus di output dari koordinat input
+void drawBBoxesOnOutput(Mat &out, Mat &map1, const vector<detection>& dets, ViewMode mode) {
+    if (dets.empty()) return;
 
-    if (isdigit(src[0])) {
-        // === KAMERA (/dev/videoX) ===
-        // Kita paksa resolusi kamera agar sesuai dengan IN_W dan IN_H
-        // yang sudah diset di main() berdasarkan resolusi benchmark yang dipilih.
-        pipe = "v4l2src device=/dev/video" + src +
-                " ! image/jpeg, width=" + to_string(IN_W) +
-                ", height=" + to_string(IN_H) +
-                " ! jpegdec ! videoconvert ! video/x-raw,format=BGR"
-                " ! appsink drop=true sync=false";
-        
-        cout << "[CAPTURE] Camera Force Resolution: " << IN_W << "x" << IN_H << endl;
-    } 
-    else {
-        // === VIDEO FILE ===
-        // Decodebin otomatis menyesuaikan resolusi file asli
-        pipe = "filesrc location=" + src +
-               " ! decodebin ! queue"
-               " ! videoconvert ! video/x-raw,format=BGR"
-               " ! appsink max-buffers=2 drop=true sync=false";
+    vector<detection> valid_dets;
+    valid_dets.reserve(dets.size());
+    for (const auto& d : dets) {
+        if (d.prob > 0.50) { 
+            valid_dets.push_back(d);
+        }
+    }
+    if (valid_dets.empty()) return;
+
+    vector<Rect> regions;
+    if (mode == MODE_MAIN) {
+        int split_y = OUT_H / 2;
+        int third_w = OUT_W / 3;
+        regions.push_back(Rect(0, 0, OUT_W, split_y));            
+        regions.push_back(Rect(0, split_y, third_w, split_y));    
+        regions.push_back(Rect(third_w, split_y, third_w, split_y)); 
+        regions.push_back(Rect(2*third_w, split_y, third_w, split_y)); 
+    } else if (mode == MODE_TRIPLE) {
+        int w = OUT_W / 3;
+        regions.push_back(Rect(0, 0, w, OUT_H)); 
+        regions.push_back(Rect(w, 0, w, OUT_H)); 
+        regions.push_back(Rect(2*w, 0, w, OUT_H));
+    } else {
+        regions.push_back(Rect(0, 0, OUT_W, OUT_H));
     }
 
-    cout << "[CAPTURE] Pipeline: " << pipe << endl;
+    struct BoxCoords { int min_x=9999, min_y=9999, max_x=-1, max_y=-1; bool found=false; };
+    vector<BoxCoords> out_boxes(valid_dets.size());
+
+    int step = 20; 
+
+    for (const auto& roi : regions) {
+        for(auto &b : out_boxes) { b.found = false; b.min_x=9999; b.min_y=9999; b.max_x=-1; b.max_y=-1; }
+
+        for (int y = roi.y; y < roi.y + roi.height; y += step) {
+            short* ptr_map = map1.ptr<short>(y);
+            
+            for (int x = roi.x; x < roi.x + roi.width; x += step) {
+                int idx = x * 2;
+                int src_x = ptr_map[idx];
+                int src_y = ptr_map[idx+1];
+
+                if (src_x <= 0) continue;
+
+                for (size_t i = 0; i < valid_dets.size(); ++i) {
+                    const auto& d = valid_dets[i];
+                    int dx = d.bbox.x - d.bbox.w/2;
+                    int dy = d.bbox.y - d.bbox.h/2;
+                    
+                    if (src_x >= dx && src_x < dx + d.bbox.w) {
+                        if (src_y >= dy && src_y < dy + d.bbox.h) {
+                            auto& box = out_boxes[i];
+                            if (x < box.min_x) box.min_x = x;
+                            if (y < box.min_y) box.min_y = y;
+                            if (x > box.max_x) box.max_x = x;
+                            if (y > box.max_y) box.max_y = y;
+                            box.found = true;
+                            break; 
+                        }
+                    }
+                }
+            }
+        }
+
+        for (size_t i = 0; i < valid_dets.size(); ++i) {
+            if (out_boxes[i].found) {
+                int bx = out_boxes[i].min_x;
+                int by = out_boxes[i].min_y;
+                int bw = out_boxes[i].max_x - out_boxes[i].min_x;
+                int bh = out_boxes[i].max_y - out_boxes[i].min_y;
+                
+                int pad = step / 2;
+                bx = max(roi.x, bx - pad);
+                by = max(roi.y, by - pad);
+                bw += step;
+                bh += step;
+
+                if (bx + bw > roi.x + roi.width) bw = (roi.x + roi.width) - bx;
+                if (by + bh > roi.y + roi.height) bh = (roi.y + roi.height) - by;
+
+                if (bw > 10 && bh > 10) {
+                    rectangle(out, Rect(bx, by, bw, bh), Scalar(0, 255, 0), 2);
+                    putText(out, to_string((int)(valid_dets[i].prob*100))+"%", 
+                            Point(bx, by > 20 ? by-5 : by+15), 
+                            FONT_HERSHEY_SIMPLEX, 0.6, Scalar(0,255,0), 2);
+                }
+            }
+        }
+    }
+}
+void captureThread(string src) {
+    string pipe;
+    bool is_yuyv_mode = false;
+
+    // === OPTIMASI PIPELINE: NO VIDEO CONVERT ===
+    // Menggunakan YUY2 langsung (Tanpa CPU Conversion)
+    if (isdigit(src[0])) {
+        // Minta format YUY2 (YUV422) yang didukung banyak kamera & DRP-AI
+        pipe = "v4l2src device=/dev/video" + src +
+                " ! video/x-raw, width=" + to_string(IN_W) +
+                ", height=" + to_string(IN_H) + ", format=YUY2" + 
+                " ! appsink drop=true sync=false";
+        
+        cout << "[CAPTURE] ZERO-CPU Pipeline: " << pipe << endl;
+        is_yuyv_mode = true;
+    } 
+    else {
+        // Untuk File, kita tetap decode tapi output YUY2 agar konsisten
+        pipe = "filesrc location=" + src +
+               " ! decodebin ! queue"
+               " ! videoconvert ! video/x-raw,format=YUY2"
+               " ! appsink max-buffers=2 drop=true sync=false";
+        is_yuyv_mode = true;
+    }
+
     VideoCapture *cap = new VideoCapture(pipe, CAP_GSTREAMER);
 
     if (!cap->isOpened()) { 
@@ -400,33 +515,35 @@ void captureThread(string src) {
         return; 
     }
 
-    // Cek resolusi aktual yang didapat (kadang kamera menolak jika hardware tidak support)
     int actual_w = (int)cap->get(CAP_PROP_FRAME_WIDTH);
     int actual_h = (int)cap->get(CAP_PROP_FRAME_HEIGHT);
     cout << "[INFO] Source Opened Resolution: " << actual_w << " x " << actual_h << endl;
 
-    Mat temp;
+    int fail_count = 0;
     while(isRunning) {
         auto t1 = chrono::steady_clock::now();
         
-        if (!cap->read(temp) || temp.empty()) {
-             // Jika file habis, ulang dari awal
-             if (!isdigit(src[0])) cap->set(CAP_PROP_POS_FRAMES, 0);
+        int idx = w_idx_cap;
+        
+        // Baca RAW YUYV ke Buffer DMA
+        if (!cap->read(inputPool[idx].data)) {
+             if (!isdigit(src[0])) {
+                 cap->set(CAP_PROP_POS_FRAMES, 0);
+             } else {
+                 fail_count++;
+                 if(fail_count > 100) {
+                    cerr << "[CAPTURE] Camera seems dead!" << endl;
+                    this_thread::sleep_for(chrono::milliseconds(100));
+                 }
+             }
              continue;
         }
+        fail_count = 0;
 
         auto t2 = chrono::steady_clock::now();
         stats_read_ms.store(chrono::duration_cast<chrono::milliseconds>(t2 - t1).count());
-
-        // Jika resolusi kamera yang didapat ternyata beda (hardware limitation),
-        // Kita resize paksa di sini agar tidak crash di DRP-AI
-        if (temp.cols != IN_W || temp.rows != IN_H) {
-            resize(temp, temp, Size(IN_W, IN_H));
-        }
-
-        int idx = w_idx_cap;
-        temp.copyTo(inputPool[idx].data);
         
+        // Flush Cache agar OCA/DRP-AI bisa baca data terbaru
         buffer_flush_dmabuf(inputPool[idx].dbuf.idx, inputPool[idx].dbuf.size);
 
         {
@@ -439,6 +556,7 @@ void captureThread(string src) {
         cv_drp.notify_one();
     }
 
+    cap->release(); 
     delete cap;
 }
 
@@ -453,30 +571,7 @@ void drawDetectionsOnInput(Mat &img, const vector<detection>& dets) {
     }
 }
 
-void drawInfoBox(Mat &img) {
-    // int start_y = 30;
-    // int line_h  = 25;
-
-    // // vector<string> lines;
-    // // if (is_paused) 
-    // //     lines.push_back("MODE: PAUSED");
-    // // else 
-    // //     lines.push_back("MODE: Running");
-
-    // int box_w = 240;
-    // int box_h = lines.size() * line_h + 10;
-
-    // Mat roi = img(Rect(10, 5, box_w, box_h));
-    // Mat color(roi.size(), CV_8UC3, Scalar(0, 0, 0));
-    // addWeighted(color, 0.6, roi, 0.4, 0.0, roi);
-
-    // // for (size_t i = 0; i < lines.size(); i++) {
-    // //     putText(img, lines[i], Point(21, start_y + i*line_h + 1),
-    // //             FONT_HERSHEY_SIMPLEX, 0.6, Scalar(0,0,0), 2);
-    // //     putText(img, lines[i], Point(20, start_y + i*line_h),
-    // //             FONT_HERSHEY_SIMPLEX, 0.6, Scalar(0,255,0), 1.5);
-    // // }
-}
+void drawInfoBox(Mat &img) {}
 
 
 gboolean update_gui_image(gpointer user_data) {
@@ -504,11 +599,6 @@ gboolean update_gui_image(gpointer user_data) {
 }
 
 void pipelineThread() {
-    int drpai_fd = open("/dev/drpai0", O_RDWR);
-    uint64_t drp_addr = get_drpai_start_addr(drpai_fd);
-    if (drp_addr == 0 || !yolo.init(model_dir, drp_addr)) return;
-    close(drpai_fd);
-
     int frame_count = 0; auto last_fps_time = chrono::steady_clock::now();
 
     while(isRunning) {
@@ -523,38 +613,68 @@ void pipelineThread() {
         int idx_in = -1;
         { 
             unique_lock<mutex> lock(mtxData); 
-            cv_drp.wait(lock, []{ return inputPool[r_idx_drp].ready || !isRunning; }); 
-            if(!isRunning) break; 
-            idx_in = r_idx_drp; inputPool[idx_in].ready = false; 
+            if(cv_drp.wait_for(lock, chrono::milliseconds(1000), []{ return inputPool[r_idx_drp].ready || !isRunning; })) {
+                if(!isRunning) break; 
+                idx_in = r_idx_drp; inputPool[idx_in].ready = false; 
+            } else {
+                continue;
+            }
         }
         
         int idx_out = w_idx_drp;
         int map_idx = active_map_idx.load();
         
         AiStats ai_stats;
-        vector<detection> results = yolo.run_detection(inputPool[idx_in].data, ai_stats);
-        stats_ai_ms.store(ai_stats.total);
-        drawDetectionsOnInput(inputPool[idx_in].data, results);
+        vector<detection> results;
         
+        // === OCA & DRP-AI PROCESSING ===
+        // Karena kita menggunakan OCA (HW) dan DRP-AI (HW), kita jalankan Sequential.
+        // Hardware DRP akan mengurus paralelisasi internal. OpenMP di sini malah nambah overhead CPU.
+        
+        // 1. Convert YUYV (Cam) -> BGR (Process Buffer)
+        // INI KUNCI ZERO CPU: cv::cvtColor ini di-intercept oleh library OCA Renesas
+        // dan dijalankan di hardware DRP, BUKAN CPU.
+        // Input: inputPool (YUYV), Output: processPool (BGR)
+        auto t_conv_start = chrono::steady_clock::now();
+        cv::cvtColor(inputPool[idx_in].data, processPool[idx_in].data, COLOR_YUV2BGR_YUY2);
+        
+        // Flush buffer hasil konversi agar AI bisa baca
+        buffer_flush_dmabuf(processPool[idx_in].dbuf.idx, processPool[idx_in].dbuf.size);
+        
+        // 2. Run DRP-AI YOLO (Menggunakan buffer BGR yang baru dikonversi)
+        // DRP-AI membaca dari Physical Address processPool
+        results = yolo.run_detection(processPool[idx_in].data, ai_stats);
+        stats_ai_ms.store(ai_stats.total);
+
+        // 3. Remap Fisheye -> Output Buffer (Display)
+        // cv::remap ini juga di-intercept oleh OCA (Hardware Accelerated)
         auto t_remap_start = chrono::steady_clock::now();
         if (maps_ready && !map1_bufs[map_idx].data.empty()) {
-            cv::remap(inputPool[idx_in].data, outputPool[idx_out].data, map1_bufs[map_idx].data, map2_bufs[map_idx].data, INTER_NEAREST, BORDER_CONSTANT);
+            cv::remap(processPool[idx_in].data, outputPool[idx_out].data, map1_bufs[map_idx].data, map2_bufs[map_idx].data, INTER_NEAREST, BORDER_CONSTANT);
         } else {
-            cv::resize(inputPool[idx_in].data, outputPool[idx_out].data, Size(OUT_W, OUT_H));
+            // Jika map belum siap, copy saja biar ada gambar
+            processPool[idx_in].data.copyTo(outputPool[idx_out].data); 
         }
         auto t_remap_end = chrono::steady_clock::now();
         stats_remap_ms.store(chrono::duration_cast<chrono::milliseconds>(t_remap_end - t_remap_start).count());
 
-        cv::cvtColor(outputPool[idx_out].data, outputPool[idx_out].data, COLOR_BGR2RGB);
-        drawInfoBox(outputPool[idx_out].data);
+        // 4. Draw Boxes (CPU - Ringan)
+        // Menggambar kotak hasil deteksi ke gambar output yang sudah di-remap
+        if (maps_ready && !map1_bufs[map_idx].data.empty()) {
+            drawBBoxesOnOutput(outputPool[idx_out].data, map1_bufs[map_idx].data, results, current_mode.load());
+        }
 
+        // Convert ke RGB untuk Display GTK (OCA Accelerated)
+        cv::cvtColor(outputPool[idx_out].data, outputPool[idx_out].data, COLOR_BGR2RGB);
+        
+        // --- FPS COUNTER ---
         frame_count++;
         auto now = chrono::steady_clock::now();
         double elapsed_ms = chrono::duration_cast<chrono::milliseconds>(now - last_fps_time).count();
         if(elapsed_ms >= 1000.0) {
             stats_fps.store((frame_count * 1000.0) / elapsed_ms);
             frame_count = 0; last_fps_time = now;
-            printf("FPS: %d\n", (int)stats_fps.load());
+            printf("FPS: %d | AI: %.1fms | Remap: %.1fms\n", (int)stats_fps.load(), ai_stats.total, stats_remap_ms.load());
         }
 
         buffer_flush_dmabuf(outputPool[idx_out].dbuf.idx, outputPool[idx_out].dbuf.size);
@@ -571,9 +691,18 @@ void pipelineThread() {
 }
 
 extern "C" {
-    void on_window_destroy(GtkWidget *object, gpointer user_data) { isRunning = false; gtk_main_quit(); }
-    gboolean on_key_press(GtkWidget *widget, GdkEventKey *event, gpointer user_data) { if (event->keyval == GDK_KEY_Escape) { isRunning = false; gtk_main_quit(); return TRUE; } return FALSE; }
-
+    void on_window_destroy(GtkWidget *object, gpointer user_data) { 
+        isRunning = false; 
+        gtk_main_quit(); 
+    }
+    gboolean on_key_press(GtkWidget *widget, GdkEventKey *event, gpointer user_data) { 
+        if (event->keyval == GDK_KEY_Escape) { 
+            isRunning = false; 
+            gtk_main_quit(); 
+            return TRUE; 
+        } 
+        return FALSE; 
+    }
     void on_btn_main_clicked(GtkButton *b) { current_mode = MODE_MAIN; }
     void on_btn_orig_clicked(GtkButton *b) { current_mode = MODE_ORIGINAL; }
     void on_btn_pano_clicked(GtkButton *b) { current_mode = MODE_PANORAMA; }
@@ -602,7 +731,7 @@ extern "C" {
     void on_btn_pause_toggled(GtkToggleButton *b) { is_paused = gtk_toggle_button_get_active(b); }
     void on_btn_save_clicked(GtkButton *b) { saveConfig(); }
 
-    // === MOUSE DETEKSI: 3 VIEW DI BAWAH MODE MAIN ===
+    // === MOUSE DETEKSI ===
     gboolean on_mouse_down(GtkWidget *widget, GdkEventButton *event, gpointer user_data) { 
         if (event->button == 1) { 
             is_dragging = true; 
@@ -615,7 +744,6 @@ extern "C" {
                 if (event->y < h/2) {
                      active_view_id = 3; // Pano
                 } else {
-                    // Di bawah: Split 3
                     if (event->x < w/3) active_view_id = 0;      // View 1 (Kiri)
                     else if (event->x < (2*w)/3) active_view_id = 1; // View 2 (Tengah)
                     else active_view_id = 2;                     // View 3 (Kanan)
@@ -644,9 +772,7 @@ extern "C" {
         } 
         return TRUE; 
     }
-    
     gboolean on_mouse_up(GtkWidget *widget, GdkEventButton *event, gpointer user_data) { is_dragging = false; return TRUE; }
-    
     gboolean on_mouse_move(GtkWidget *widget, GdkEventMotion *event, gpointer user_data) { 
         if (is_dragging) { 
             float dx = (event->x - last_mouse_x) * 0.2f; 
@@ -697,6 +823,7 @@ extern "C" {
 
 int main(int argc, char** argv) {
     try {
+        signal(SIGINT, signal_handler);
         putenv((char*)"GST_DEBUG=*:0");
         moildev_app_get_resource();
         
@@ -729,25 +856,56 @@ int main(int argc, char** argv) {
 
         unsetenv("LD_LIBRARY_PATH"); initDRP();
         
-        inputPool.resize(BUFFER_SIZE); outputPool.resize(BUFFER_SIZE);
+        // Alokasi Buffer Pools
+        inputPool.resize(BUFFER_SIZE); 
+        processPool.resize(BUFFER_SIZE); // Buffer Tengah (BGR)
+        outputPool.resize(BUFFER_SIZE);
+        
         for(int i=0; i<BUFFER_SIZE; i++) { 
-            allocateDRPBuffer(inputPool[i], IN_W, IN_H, CV_8UC3); 
+            // Input Pool: YUYV (2 Byte/Pixel)
+            allocateDRPBuffer(inputPool[i], IN_W, IN_H, CV_8UC2); 
+            // Process Pool: BGR (3 Byte/Pixel) untuk input AI & Remap
+            allocateDRPBuffer(processPool[i], IN_W, IN_H, CV_8UC3);
+            // Output Pool: BGR (3 Byte/Pixel) untuk Display
             allocateDRPBuffer(outputPool[i], OUT_W, OUT_H, CV_8UC3); 
         }
         for(int i=0; i<MAP_BUFFER_COUNT; i++) { 
             allocateDRPBuffer(map1_bufs[i], OUT_W, OUT_H, CV_16SC2); 
             allocateDRPBuffer(map2_bufs[i], OUT_W, OUT_H, CV_16UC1); 
         }
+
+        cout << "[INIT] Initializing DRP-AI YOLO... (Please Wait)" << endl;
+        int drpai_fd = open("/dev/drpai0", O_RDWR);
+        if (drpai_fd >= 0) {
+            uint64_t drp_addr = get_drpai_start_addr(drpai_fd);
+            close(drpai_fd);
+            if (!yolo.init(model_dir, drp_addr)) {
+                cerr << "[ERROR] Failed to init YOLO model!" << endl;
+                return -1;
+            }
+        } else {
+            cerr << "[ERROR] Failed to open /dev/drpai0" << endl;
+            return -1;
+        }
+        cout << "[INIT] YOLO Ready!" << endl;
         
+        gtk_widget_show_all(main_window);
+
         thread t1(captureThread, argv[1]); 
+        this_thread::sleep_for(chrono::milliseconds(200)); 
+        
         thread t2(mapUpdateThread); 
         thread t3(pipelineThread); 
 
-        gtk_widget_show_all(main_window);
         gtk_main();
         
-        isRunning = false; cv_drp.notify_all(); 
-        t1.join(); t2.join(); t3.join(); 
+        isRunning = false; 
+        cv_drp.notify_all(); 
+        if(t1.joinable()) t1.join(); 
+        if(t2.joinable()) t2.join(); 
+        if(t3.joinable()) t3.join(); 
+        
+        cleanup_resources();
         return 0;
 
     } catch (const std::exception& e) { return -1; }
