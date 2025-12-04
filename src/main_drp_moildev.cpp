@@ -41,11 +41,12 @@ int SEL_RES_IDX = 0;
 struct Resolution { int w; int h; string name; };
 
 const vector<Resolution> BENCHMARK_RES = {
+    {640, 480,  "VGA (480p)"},
     {1024, 768,  "0.8 MP (HD)"},    
     {1600, 1200, "2.0 MP (FHD)"},   
     {1920, 1080, "2.0 MP (1080p)"}, 
     {2592, 1944, "5.0 MP (2K/5MP)"},
-    {1440, 480,  "Triple Strip (3x480)"}
+    
 };
 
 // Fisheye Params
@@ -116,6 +117,7 @@ DrpAiYolo yolo;
 // Mouse
 double last_mouse_x, last_mouse_y;
 bool is_dragging = false;
+bool IS_CAMERA_MODE = false;
 
 // --- Helper Functions ---
 uint64_t get_drpai_start_addr(int drpai_fd) {
@@ -388,6 +390,7 @@ void mapUpdateThread() {
     }
 }
 
+
 // Helper: Cari bounding box lurus di output dari koordinat input
 void drawBBoxesOnOutput(Mat &out, Mat &map1, const vector<detection>& dets, ViewMode mode) {
     if (dets.empty()) return;
@@ -484,66 +487,50 @@ void drawBBoxesOnOutput(Mat &out, Mat &map1, const vector<detection>& dets, View
 }
 void captureThread(string src) {
     string pipe;
-    bool is_yuyv_mode = false;
+    bool is_file = !isdigit(src[0]);
 
-    // === OPTIMASI PIPELINE: NO VIDEO CONVERT ===
-    // Menggunakan YUY2 langsung (Tanpa CPU Conversion)
-    if (isdigit(src[0])) {
-        // Minta format YUY2 (YUV422) yang didukung banyak kamera & DRP-AI
+    if (!is_file) {
         pipe = "v4l2src device=/dev/video" + src +
-                " ! video/x-raw, width=" + to_string(IN_W) +
-                ", height=" + to_string(IN_H) + ", format=YUY2" + 
-                " ! appsink drop=true sync=false";
-        
-        cout << "[CAPTURE] ZERO-CPU Pipeline: " << pipe << endl;
-        is_yuyv_mode = true;
-    } 
-    else {
-        // Untuk File, kita tetap decode tapi output YUY2 agar konsisten
+               " ! video/x-raw, width=" + to_string(IN_W) + ", height=" + to_string(IN_H) + ", format=YUY2"
+               " ! queue max-size-buffers=2"
+               " ! appsink drop=true sync=false";
+        cout << "[CAPTURE] Mode: Camera Live" << endl;
+    } else {
         pipe = "filesrc location=" + src +
                " ! decodebin ! queue"
                " ! videoconvert ! video/x-raw,format=YUY2"
-               " ! appsink max-buffers=2 drop=true sync=false";
-        is_yuyv_mode = true;
+               " ! appsink max-buffers=2 drop=true sync=true";
+        cout << "[CAPTURE] Mode: Video File (Follow Original FPS)" << endl;
     }
 
     VideoCapture *cap = new VideoCapture(pipe, CAP_GSTREAMER);
-
     if (!cap->isOpened()) { 
-        cerr << "[ERROR] Gagal membuka kamera/file: " << src << endl;
+        cerr << "[ERROR] Gagal membuka source: " << src << endl;
         isRunning = false; 
         return; 
     }
 
-    int actual_w = (int)cap->get(CAP_PROP_FRAME_WIDTH);
-    int actual_h = (int)cap->get(CAP_PROP_FRAME_HEIGHT);
-    cout << "[INFO] Source Opened Resolution: " << actual_w << " x " << actual_h << endl;
-
-    int fail_count = 0;
-    while(isRunning) {
-        auto t1 = chrono::steady_clock::now();
-        
-        int idx = w_idx_cap;
-        
-        // Baca RAW YUYV ke Buffer DMA
-        if (!cap->read(inputPool[idx].data)) {
-             if (!isdigit(src[0])) {
-                 cap->set(CAP_PROP_POS_FRAMES, 0);
-             } else {
-                 fail_count++;
-                 if(fail_count > 100) {
-                    cerr << "[CAPTURE] Camera seems dead!" << endl;
-                    this_thread::sleep_for(chrono::milliseconds(100));
-                 }
-             }
-             continue;
+    Mat temp;
+    while (isRunning) {
+        if (!cap->read(temp) || temp.empty()) { 
+            if (is_file) {
+                cout << "[CAPTURE] Video Ended. Replaying..." << endl;
+                cap->set(CAP_PROP_POS_FRAMES, 0); 
+            }
+            continue; 
         }
-        fail_count = 0;
 
-        auto t2 = chrono::steady_clock::now();
-        stats_read_ms.store(chrono::duration_cast<chrono::milliseconds>(t2 - t1).count());
-        
-        // Flush Cache agar OCA/DRP-AI bisa baca data terbaru
+        if (temp.cols != IN_W || temp.rows != IN_H) {
+            resize(temp, temp, Size(IN_W, IN_H));
+        }
+
+        int idx = w_idx_cap;
+        size_t frame_size = IN_W * IN_H * 2; // YUY2 = 2 bytes per pixel
+
+        if (inputPool[idx].data.data && temp.data) {
+            std::memcpy(inputPool[idx].data.data, temp.data, frame_size);
+        }
+
         buffer_flush_dmabuf(inputPool[idx].dbuf.idx, inputPool[idx].dbuf.size);
 
         {
@@ -552,11 +539,10 @@ void captureThread(string src) {
             w_idx_cap = (w_idx_cap + 1) % BUFFER_SIZE;
             r_idx_drp = idx;
         }
-
         cv_drp.notify_one();
     }
-
-    cap->release(); 
+    
+    if (cap->isOpened()) cap->release();
     delete cap;
 }
 
@@ -574,32 +560,80 @@ void drawDetectionsOnInput(Mat &img, const vector<detection>& dets) {
 void drawInfoBox(Mat &img) {}
 
 
-gboolean update_gui_image(gpointer user_data) {
+gboolean update_gui_image(gpointer user_data)
+{
     int idx = (int)(intptr_t)user_data;
-    if(idx < 0 || idx >= BUFFER_SIZE) { ui_update_pending = false; return FALSE; }
+    if (idx < 0 || idx >= BUFFER_SIZE) {
+        ui_update_pending = false;
+        return FALSE;
+    }
+
     Mat &src = outputPool[idx].data;
-    
+
+    // Ambil ukuran widget
     int avail_w = gtk_widget_get_allocated_width(img_display);
     int avail_h = gtk_widget_get_allocated_height(img_display);
-    if (avail_w < 100) avail_w = 1024;
-    if (avail_h < 100) avail_h = 768;
-    int dest_w, dest_h; float ratio = (float)OUT_W / (float)OUT_H;
-    
-    if ((float)avail_w / avail_h > ratio) { dest_h = avail_h; dest_w = (int)(dest_h * ratio); } 
-    else { dest_w = avail_w; dest_h = (int)(dest_w / ratio); }
 
-    GdkPixbuf *pixbuf = gdk_pixbuf_new_from_data(src.data, GDK_COLORSPACE_RGB, FALSE, 8, src.cols, src.rows, src.step, NULL, NULL);
-    if (pixbuf) { 
-        GdkPixbuf *scaled = gdk_pixbuf_scale_simple(pixbuf, dest_w, dest_h, GDK_INTERP_NEAREST);
-        gtk_image_set_from_pixbuf(GTK_IMAGE(img_display), scaled); 
-        g_object_unref(scaled); g_object_unref(pixbuf); 
+    // Ambil ukuran layar asli
+    GdkScreen *screen = gdk_screen_get_default();
+    int screen_w = gdk_screen_get_width(screen);
+    int screen_h = gdk_screen_get_height(screen);
+
+    // // Log semua ukuran
+    // std::cout << "\n=== DISPLAY SIZE INFO ===" << std::endl;
+    // std::cout << "Screen size  : " << screen_w << " x " << screen_h << std::endl;
+    // std::cout << "Widget size  : " << avail_w << " x " << avail_h << std::endl;
+    // std::cout << "Source (Mat) : " << src.cols << " x " << src.rows << std::endl;
+
+    // Kalau widget belum valid, pakai ukuran layar
+    if (avail_w < 1) avail_w = screen_w;
+    if (avail_h < 1) avail_h = screen_h;
+
+    int dest_w = avail_w;   // FULL LEBAR
+    int dest_h = 1150;       // TINGGI DIKUNCI
+
+    // std::cout << "Render size  : " << dest_w << " x " << dest_h << std::endl;
+    // std::cout << "===========================\n" << std::endl;
+
+    GdkPixbuf *pixbuf = gdk_pixbuf_new_from_data(
+        src.data,
+        GDK_COLORSPACE_RGB,
+        FALSE,
+        8,
+        src.cols,
+        src.rows,
+        src.step,
+        NULL,
+        NULL
+    );
+
+    if (pixbuf) {
+        GdkPixbuf *scaled = gdk_pixbuf_scale_simple(
+            pixbuf,
+            dest_w,
+            dest_h,
+            GDK_INTERP_NEAREST
+        );
+
+        gtk_image_set_from_pixbuf(GTK_IMAGE(img_display), scaled);
+        g_object_unref(scaled);
+        g_object_unref(pixbuf);
     }
-    outputPool[idx].ready = false; ui_update_pending = false; 
+
+    outputPool[idx].ready = false;
+    ui_update_pending = false;
     return FALSE;
 }
 
+
+
 void pipelineThread() {
-    int frame_count = 0; auto last_fps_time = chrono::steady_clock::now();
+    int frame_count = 0; 
+    auto last_fps_time = chrono::steady_clock::now();
+
+    // Variable untuk menyimpan hasil deteksi frame sebelumnya (untuk mode Kamera)
+    vector<detection> cached_results;
+    int ai_skip_counter = 0; 
 
     while(isRunning) {
         if (is_paused.load()) {
@@ -627,54 +661,107 @@ void pipelineThread() {
         AiStats ai_stats;
         vector<detection> results;
         
-        // === OCA & DRP-AI PROCESSING ===
-        // Karena kita menggunakan OCA (HW) dan DRP-AI (HW), kita jalankan Sequential.
-        // Hardware DRP akan mengurus paralelisasi internal. OpenMP di sini malah nambah overhead CPU.
-        
-        // 1. Convert YUYV (Cam) -> BGR (Process Buffer)
-        // INI KUNCI ZERO CPU: cv::cvtColor ini di-intercept oleh library OCA Renesas
-        // dan dijalankan di hardware DRP, BUKAN CPU.
-        // Input: inputPool (YUYV), Output: processPool (BGR)
+        // === 1. Convert YUYV (Cam) -> BGR (Process Buffer) ===
+        // Selalu dijalankan karena dibutuhkan untuk Remap (Display) dan AI
         auto t_conv_start = chrono::steady_clock::now();
         cv::cvtColor(inputPool[idx_in].data, processPool[idx_in].data, COLOR_YUV2BGR_YUY2);
-        
-        // Flush buffer hasil konversi agar AI bisa baca
         buffer_flush_dmabuf(processPool[idx_in].dbuf.idx, processPool[idx_in].dbuf.size);
         
-        // 2. Run DRP-AI YOLO (Menggunakan buffer BGR yang baru dikonversi)
-        // DRP-AI membaca dari Physical Address processPool
-        results = yolo.run_detection(processPool[idx_in].data, ai_stats);
-        stats_ai_ms.store(ai_stats.total);
+        // === 2. Run DRP-AI YOLO (LOGIKA BARU) ===
+        bool run_inference = true;
 
-        // 3. Remap Fisheye -> Output Buffer (Display)
-        // cv::remap ini juga di-intercept oleh OCA (Hardware Accelerated)
+        if (IS_CAMERA_MODE) {
+            // --- MODE KAMERA (LIGHTER MODE) ---
+            // Kita skip AI inference untuk mengejar 30 FPS.
+            // Jalankan AI hanya setiap 3 frame (Frame 0: Run, Frame 1: Skip, Frame 2: Skip)
+            if (ai_skip_counter % 3 != 0) {
+                run_inference = false;
+            }
+            ai_skip_counter++;
+        } else {
+            // --- MODE VIDEO FILE (HEAVY MODE) ---
+            // Jalankan AI di setiap frame seperti kode asli
+            run_inference = true;
+        }
+
+        if (run_inference) {
+            // Berat: Jalankan DRP-AI
+            results = yolo.run_detection(processPool[idx_in].data, ai_stats);
+            
+            // Simpan hasil untuk frame berikutnya yang di-skip
+            cached_results = results; 
+            stats_ai_ms.store(ai_stats.total);
+        } else {
+            // Ringan: Pakai hasil frame sebelumnya (tanpa membebani DRP-AI)
+            results = cached_results;
+            
+            // Set stats 0 atau nilai terakhir agar log tidak bingung
+            ai_stats.total = 0; 
+        }
+
+        // === 3. Remap Fisheye -> Output Buffer (Display) ===
         auto t_remap_start = chrono::steady_clock::now();
         if (maps_ready && !map1_bufs[map_idx].data.empty()) {
             cv::remap(processPool[idx_in].data, outputPool[idx_out].data, map1_bufs[map_idx].data, map2_bufs[map_idx].data, INTER_NEAREST, BORDER_CONSTANT);
         } else {
-            // Jika map belum siap, copy saja biar ada gambar
             processPool[idx_in].data.copyTo(outputPool[idx_out].data); 
         }
         auto t_remap_end = chrono::steady_clock::now();
         stats_remap_ms.store(chrono::duration_cast<chrono::milliseconds>(t_remap_end - t_remap_start).count());
 
-        // 4. Draw Boxes (CPU - Ringan)
-        // Menggambar kotak hasil deteksi ke gambar output yang sudah di-remap
+        // === 4. Draw Boxes (CPU - Ringan) ===
         if (maps_ready && !map1_bufs[map_idx].data.empty()) {
+            // Gambar kotak (baik hasil AI baru maupun hasil cache)
             drawBBoxesOnOutput(outputPool[idx_out].data, map1_bufs[map_idx].data, results, current_mode.load());
         }
 
-        // Convert ke RGB untuk Display GTK (OCA Accelerated)
+        // Convert ke RGB untuk Display GTK
         cv::cvtColor(outputPool[idx_out].data, outputPool[idx_out].data, COLOR_BGR2RGB);
         
         // --- FPS COUNTER ---
         frame_count++;
         auto now = chrono::steady_clock::now();
         double elapsed_ms = chrono::duration_cast<chrono::milliseconds>(now - last_fps_time).count();
-        if(elapsed_ms >= 1000.0) {
-            stats_fps.store((frame_count * 1000.0) / elapsed_ms);
+        if(elapsed_ms >= 1000.0) { 
+            double current_fps = (frame_count * 1000.0) / elapsed_ms;
+            stats_fps.store(current_fps);
             frame_count = 0; last_fps_time = now;
-            printf("FPS: %d | AI: %.1fms | Remap: %.1fms\n", (int)stats_fps.load(), ai_stats.total, stats_remap_ms.load());
+            
+            string mode_name = "Unknown";
+            switch(current_mode.load()) {
+                case MODE_MAIN: mode_name = "Main"; break;
+                case MODE_ORIGINAL: mode_name = "Original"; break;
+                case MODE_PANORAMA: mode_name = "Panorama"; break;
+                case MODE_GRID: mode_name = "Grid"; break;
+                case MODE_SINGLE: mode_name = "Single"; break;
+                case MODE_TRIPLE: mode_name = "Triple"; break;
+            }
+
+            printf("\n=================[ PERFORMANCE LOG ]=================\n");
+            printf(" [GENERAL]\n");
+            printf("  > Source    : %s\n", IS_CAMERA_MODE ? "Camera (Lighter Mode)" : "Video File (Full AI)");
+            printf("  > Mode      : %s\n", mode_name.c_str());
+            printf("  > FPS       : %d\n", (int)current_fps);
+            printf("  > Input     : %dx%d\n", IN_W, IN_H);
+            printf("  > Output    : %dx%d\n", OUT_W, OUT_H);
+            printf(" ----------------------------------------------------\n");
+            printf(" [PIPELINE LATENCY]\n");
+            printf("  > Read      : %.2f ms\n", stats_read_ms.load());
+            printf("  > Map       : %.2f ms\n", stats_map_ms.load());
+            printf("  > Remap     : %.2f ms\n", stats_remap_ms.load());
+            // Total waktu sedikit bias jika AI diskip, tapi ini memberi gambaran latency per frame display
+            printf("  > Total     : %.2f ms\n", stats_read_ms.load() + stats_ai_ms.load() + stats_remap_ms.load());
+            printf(" ----------------------------------------------------\n");
+            printf(" [AI DETAILS]\n");
+            if (IS_CAMERA_MODE && !run_inference) {
+                 printf("  > Status    : CACHED (Skipped for Performance)\n");
+            } else {
+                 printf("  > Status    : RUNNING\n");
+                 printf("  > AI Total  : %.2f ms\n", ai_stats.total);
+                 printf("  > Objects   : %d\n", ai_stats.count);
+            }
+            printf("=====================================================\n");
+            fflush(stdout);
         }
 
         buffer_flush_dmabuf(outputPool[idx_out].dbuf.idx, outputPool[idx_out].dbuf.size);
@@ -836,12 +923,20 @@ int main(int argc, char** argv) {
 
         string src_param = argv[1];
         if (!isdigit(src_param[0])) {
+            // Input adalah FILE VIDEO (String path)
+            IS_CAMERA_MODE = false; 
+            
             VideoCapture probe(src_param);
             if(probe.isOpened()) {
                 IN_W = (int)probe.get(CAP_PROP_FRAME_WIDTH); IN_H = (int)probe.get(CAP_PROP_FRAME_HEIGHT);
                 probe.release();
             } else { IN_W = DEFAULT_W; IN_H = DEFAULT_H; }
-        } else { IN_W = OUT_W; IN_H = OUT_H; }
+        } else { 
+            // Input adalah KAMERA (Angka index, misal 0, 1)
+            IS_CAMERA_MODE = true; 
+            
+            IN_W = OUT_W; IN_H = OUT_H; 
+        }
 
         gtk_init(&argc, &argv);
         GtkBuilder *builder = gtk_builder_new();
