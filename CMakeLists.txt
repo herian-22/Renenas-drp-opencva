@@ -7,7 +7,16 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Flag Optimasi & OpenMP (Manual Force)
 # Kita tambahkan -fopenmp di sini agar tidak perlu find_package yang sering gagal di Cross-Compile
-add_compile_options(-O3 -pthread -fPIC -fopenmp)
+add_compile_options(
+    -O3
+    -pthread
+    -fPIC
+    -fopenmp
+    -mcpu=cortex-a55       # Spesifik prosesor (sudah otomatis aktifkan NEON)
+    -mtune=cortex-a55      # Tuning instruksi
+    -ffast-math            # PERCEPAT sin/cos (Wajib untuk performa matematika)
+    -ftree-vectorize       # Paksa vektorisasi loop
+)
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -rdynamic -fopenmp")
 
 # === FIX: MANUAL INCLUDE OPENMP (POKY SDK) ===

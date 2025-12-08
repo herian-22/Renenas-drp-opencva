@@ -281,11 +281,24 @@ void mapUpdateThread() {
     this_thread::sleep_for(chrono::milliseconds(800));
 
     MoilNative moil;
+    
+    // === OPTIMASI DOWNSCALED MAP ===
+    // Menghitung Map di resolusi setengah (Scale 0.5) untuk meringankan CPU 4x lipat.
+    // Hasilnya akan di-resize kembali ke Full HD agar gambar tetap tajam.
+    int CALC_W = OUT_W / 2;
+    int CALC_H = OUT_H / 2;
+    
+    // Buffer Kecil untuk kalkulasi matematika berat
+    Mat mx_small(CALC_H, CALC_W, CV_32F);
+    Mat my_small(CALC_H, CALC_W, CV_32F);
+
+    // Buffer Akhir (Full HD) untuk dikirim ke DRP
     Mat mx(OUT_H, OUT_W, CV_32F);
     Mat my(OUT_H, OUT_W, CV_32F);
+
     ViewMode last_mode = MODE_SINGLE; 
     
-    // Cache variables
+    // Cache variables (Logic "Optimization Stability")
     float l_a=-99, l_b=-99, l_z=-99; bool l_fh=false, l_fv=false;
     float l_pa=-99, l_pb=-99; bool l_pfh=false, l_pfv=false;
     float l_v1a=-99, l_v1b=-99, l_v1z=-99; bool l_v1fh=false, l_v1fv=false;
@@ -298,6 +311,7 @@ void mapUpdateThread() {
         ViewMode mode = current_mode.load();
         bool changed = false;
 
+        // Cek apakah ada perubahan posisi/mode (Logic sama seperti original)
         if(mode != last_mode) changed = true;
         else if (mode == MODE_SINGLE) {
             if(cur_alpha!=l_a || cur_beta!=l_b || cur_zoom!=l_z || cur_flip_h!=l_fh || cur_flip_v!=l_fv) changed = true;
@@ -317,23 +331,29 @@ void mapUpdateThread() {
                view3_alpha!=l_v3a || view3_beta!=l_v3b || view3_zoom!=l_v3z || view3_flip_h!=l_v3fh || view3_flip_v!=l_v3fv) changed = true;
         }
 
+        // Jika tidak ada perubahan, tidur sebentar (Hemat CPU)
         if (maps_ready && !changed) { 
             this_thread::sleep_for(chrono::milliseconds(20)); continue; 
         }
 
         auto t1 = chrono::steady_clock::now();
         int back_idx = (active_map_idx.load() + 1) % MAP_BUFFER_COUNT;
-        mx.setTo(Scalar(-1)); my.setTo(Scalar(-1));
+        
+        // Reset buffer kecil
+        mx_small.setTo(Scalar(-1)); my_small.setTo(Scalar(-1));
 
+        // Kalkulasi di koordinat KECIL (CALC_W x CALC_H)
         switch(mode) {
             case MODE_MAIN: {
-                int split_y = OUT_H / 2;
-                int third_w = OUT_W / 3;
-                moil.fillRegion(mx, my, Rect(0, 0, OUT_W, split_y), pano_alpha.load(), pano_beta.load(), 0, true, pano_flip_h, pano_flip_v);
-                moil.fillRegion(mx, my, Rect(0, split_y, third_w, split_y), view1_alpha, view1_beta, view1_zoom, false, view1_flip_h, view1_flip_v);
-                moil.fillRegion(mx, my, Rect(third_w, split_y, third_w, split_y), view2_alpha, view2_beta, view2_zoom, false, view2_flip_h, view2_flip_v);
-                moil.fillRegion(mx, my, Rect(2*third_w, split_y, third_w, split_y), view3_alpha, view3_beta, view3_zoom, false, view3_flip_h, view3_flip_v);
+                int split_y = CALC_H / 2;
+                int third_w = CALC_W / 3;
                 
+                moil.fillRegion(mx_small, my_small, Rect(0, 0, CALC_W, split_y), pano_alpha.load(), pano_beta.load(), 0, true, pano_flip_h, pano_flip_v);
+                moil.fillRegion(mx_small, my_small, Rect(0, split_y, third_w, split_y), view1_alpha, view1_beta, view1_zoom, false, view1_flip_h, view1_flip_v);
+                moil.fillRegion(mx_small, my_small, Rect(third_w, split_y, third_w, split_y), view2_alpha, view2_beta, view2_zoom, false, view2_flip_h, view2_flip_v);
+                moil.fillRegion(mx_small, my_small, Rect(2*third_w, split_y, third_w, split_y), view3_alpha, view3_beta, view3_zoom, false, view3_flip_h, view3_flip_v);
+                
+                // Update Cache
                 l_v1a = view1_alpha; l_v1b = view1_beta; l_v1z = view1_zoom; l_v1fh = view1_flip_h; l_v1fv = view1_flip_v;
                 l_v2a = view2_alpha; l_v2b = view2_beta; l_v2z = view2_zoom; l_v2fh = view2_flip_h; l_v2fv = view2_flip_v;
                 l_v3a = view3_alpha; l_v3b = view3_beta; l_v3z = view3_zoom; l_v3fh = view3_flip_h; l_v3fv = view3_flip_v;
@@ -341,10 +361,10 @@ void mapUpdateThread() {
                 break;
             }
             case MODE_TRIPLE: {
-                int split_w = OUT_W / 3; 
-                moil.fillRegion(mx, my, Rect(0, 0, split_w, OUT_H), view1_alpha, view1_beta, view1_zoom, false, view1_flip_h, view1_flip_v);
-                moil.fillRegion(mx, my, Rect(split_w, 0, split_w, OUT_H), view2_alpha, view2_beta, view2_zoom, false, view2_flip_h, view2_flip_v);
-                moil.fillRegion(mx, my, Rect(2*split_w, 0, split_w, OUT_H), view3_alpha, view3_beta, view3_zoom, false, view3_flip_h, view3_flip_v);
+                int split_w = CALC_W / 3; 
+                moil.fillRegion(mx_small, my_small, Rect(0, 0, split_w, CALC_H), view1_alpha, view1_beta, view1_zoom, false, view1_flip_h, view1_flip_v);
+                moil.fillRegion(mx_small, my_small, Rect(split_w, 0, split_w, CALC_H), view2_alpha, view2_beta, view2_zoom, false, view2_flip_h, view2_flip_v);
+                moil.fillRegion(mx_small, my_small, Rect(2*split_w, 0, split_w, CALC_H), view3_alpha, view3_beta, view3_zoom, false, view3_flip_h, view3_flip_v);
                 
                 l_v1a = view1_alpha; l_v1b = view1_beta; l_v1z = view1_zoom; l_v1fh = view1_flip_h; l_v1fv = view1_flip_v;
                 l_v2a = view2_alpha; l_v2b = view2_beta; l_v2z = view2_zoom; l_v2fh = view2_flip_h; l_v2fv = view2_flip_v;
@@ -352,35 +372,39 @@ void mapUpdateThread() {
                 break;
             }
             case MODE_ORIGINAL: 
-                moil.fillStandard(mx, my, Rect(0, 0, OUT_W, OUT_H)); 
+                moil.fillStandard(mx_small, my_small, Rect(0, 0, CALC_W, CALC_H)); 
                 break;
             case MODE_PANORAMA: {
-                moil.fillRegion(mx, my, Rect(0, 0, OUT_W, OUT_H), pano_alpha.load(), pano_beta.load(), 0, true, pano_flip_h, pano_flip_v);
+                moil.fillRegion(mx_small, my_small, Rect(0, 0, CALC_W, CALC_H), pano_alpha.load(), pano_beta.load(), 0, true, pano_flip_h, pano_flip_v);
                 l_pa = pano_alpha; l_pb = pano_beta; l_pfh = pano_flip_h; l_pfv = pano_flip_v;
                 break;
             }
             case MODE_GRID: {
-                int bw = OUT_W/2, bh = OUT_H/2;
-                moil.fillRegion(mx, my, Rect(0, 0, bw, bh), 0, 0, 2.0, false, false, false);
-                moil.fillRegion(mx, my, Rect(bw, 0, bw, bh), 45, 0, 2.0, false, false, false);
-                moil.fillRegion(mx, my, Rect(0, bh, bw, bh), 45, -90, 2.0, false, false, false);
-                moil.fillRegion(mx, my, Rect(bw, bh, bw, bh), 45, 90, 2.0, false, false, false);
+                int bw = CALC_W/2, bh = CALC_H/2;
+                moil.fillRegion(mx_small, my_small, Rect(0, 0, bw, bh), 0, 0, 2.0, false, false, false);
+                moil.fillRegion(mx_small, my_small, Rect(bw, 0, bw, bh), 45, 0, 2.0, false, false, false);
+                moil.fillRegion(mx_small, my_small, Rect(0, bh, bw, bh), 45, -90, 2.0, false, false, false);
+                moil.fillRegion(mx_small, my_small, Rect(bw, bh, bw, bh), 45, 90, 2.0, false, false, false);
                 break;
             }
             case MODE_SINGLE: {
-                int scale = 4; int sw = OUT_W / scale; int sh = OUT_H / scale;
-                Mat smx(sh, sw, CV_32F); Mat smy(sh, sw, CV_32F);
-                moil.fillRegion(smx, smy, Rect(0, 0, sw, sh), cur_alpha, cur_beta, cur_zoom, false, cur_flip_h, cur_flip_v);
-                resize(smx, mx, Size(OUT_W, OUT_H), 0, 0, INTER_LINEAR);
-                resize(smy, my, Size(OUT_W, OUT_H), 0, 0, INTER_LINEAR);
+                // Kalkulasi di buffer kecil saja agar konsisten
+                moil.fillRegion(mx_small, my_small, Rect(0, 0, CALC_W, CALC_H), cur_alpha, cur_beta, cur_zoom, false, cur_flip_h, cur_flip_v);
                 l_a = cur_alpha; l_b = cur_beta; l_z = cur_zoom; l_fh = cur_flip_h; l_fv = cur_flip_v;
                 break;
             }
         }
         
+        // --- PROSES RESIZE (UPSCALING MAP) ---
+        // Membesarkan Map Kecil -> Map Besar
+        // INTER_LINEAR wajib dipakai agar hasil lengkungannya halus (tidak kotak-kotak)
+        resize(mx_small, mx, Size(OUT_W, OUT_H), 0, 0, INTER_LINEAR);
+        resize(my_small, my, Size(OUT_W, OUT_H), 0, 0, INTER_LINEAR);
+
         auto t2 = chrono::steady_clock::now();
         stats_map_ms.store(chrono::duration_cast<chrono::milliseconds>(t2 - t1).count());
 
+        // Konversi ke format Fixed Point untuk DRP
         convertMaps(mx, my, map1_bufs[back_idx].data, map2_bufs[back_idx].data, CV_16SC2, false);
         buffer_flush_dmabuf(map1_bufs[back_idx].dbuf.idx, map1_bufs[back_idx].dbuf.size);
         buffer_flush_dmabuf(map2_bufs[back_idx].dbuf.idx, map2_bufs[back_idx].dbuf.size);
@@ -390,75 +414,102 @@ void mapUpdateThread() {
     }
 }
 
-
-// Helper: Cari bounding box lurus di output dari koordinat input
+/**
+ * @brief Draws bounding boxes on the remapped output image based on fisheye detections.
+ * Uses a reverse-lookup strategy via map1 to translate coordinates.
+ * * @param out   The destination image (Remapped/Dewarped view).
+ * @param map1  The X-coordinate map used for cv::remap (contains source X coordinates).
+ * @param dets  Raw detections from YOLO (coordinates relative to the original fisheye image).
+ * @param mode  Current display mode (Main, Triple, etc.) to determine scanning regions.
+ */
 void drawBBoxesOnOutput(Mat &out, Mat &map1, const vector<detection>& dets, ViewMode mode) {
     if (dets.empty()) return;
 
+    // --- STEP 1: Filter Detections ---
+    // Filter out low-probability detections to reduce processing overhead.
     vector<detection> valid_dets;
     valid_dets.reserve(dets.size());
     for (const auto& d : dets) {
-        if (d.prob > 0.50) { 
+        if (d.prob > 0.50) { // Confidence threshold > 50%
             valid_dets.push_back(d);
         }
     }
     if (valid_dets.empty()) return;
 
+    // --- STEP 2: Define Search Regions (Optimization) ---
+    // Instead of scanning the whole image, we define specific Regions of Interest (ROI)
+    // based on the current ViewMode layout.
     vector<Rect> regions;
     if (mode == MODE_MAIN) {
+        // Layout: Top half is Panorama, Bottom half is split into 3 views
         int split_y = OUT_H / 2;
         int third_w = OUT_W / 3;
-        regions.push_back(Rect(0, 0, OUT_W, split_y));            
-        regions.push_back(Rect(0, split_y, third_w, split_y));    
-        regions.push_back(Rect(third_w, split_y, third_w, split_y)); 
-        regions.push_back(Rect(2*third_w, split_y, third_w, split_y)); 
+        regions.push_back(Rect(0, 0, OUT_W, split_y));            // Top Panorama
+        regions.push_back(Rect(0, split_y, third_w, split_y));    // Bottom Left
+        regions.push_back(Rect(third_w, split_y, third_w, split_y)); // Bottom Center
+        regions.push_back(Rect(2*third_w, split_y, third_w, split_y)); // Bottom Right
     } else if (mode == MODE_TRIPLE) {
+        // Layout: Screen split vertically into 3 columns
         int w = OUT_W / 3;
         regions.push_back(Rect(0, 0, w, OUT_H)); 
         regions.push_back(Rect(w, 0, w, OUT_H)); 
         regions.push_back(Rect(2*w, 0, w, OUT_H));
     } else {
+        // Full screen modes (Original, Single, Panorama Full)
         regions.push_back(Rect(0, 0, OUT_W, OUT_H));
     }
 
+    // Structure to track min/max coordinates of the projected box on the Output screen
     struct BoxCoords { int min_x=9999, min_y=9999, max_x=-1, max_y=-1; bool found=false; };
     vector<BoxCoords> out_boxes(valid_dets.size());
 
+    // --- STEP 3: Reverse Mapping (Scanning) ---
+    // Scan step size. Higher value = Faster CPU performance but lower box precision.
+    // We skip pixels to reduce the loop count (CPU optimization).
     int step = 20; 
 
     for (const auto& roi : regions) {
+        // Reset box coordinates for the current region
         for(auto &b : out_boxes) { b.found = false; b.min_x=9999; b.min_y=9999; b.max_x=-1; b.max_y=-1; }
 
+        // Loop through the Output pixels within the ROI
         for (int y = roi.y; y < roi.y + roi.height; y += step) {
-            short* ptr_map = map1.ptr<short>(y);
+            short* ptr_map = map1.ptr<short>(y); // Access the X-map row
             
             for (int x = roi.x; x < roi.x + roi.width; x += step) {
+                // Get the Source Coordinate (Fisheye Input) from the map
+                // map1 contains the 'src_x' and 'src_y' for every pixel (x,y)
                 int idx = x * 2;
                 int src_x = ptr_map[idx];
                 int src_y = ptr_map[idx+1];
 
-                if (src_x <= 0) continue;
+                if (src_x <= 0) continue; // Skip invalid mapping points (black areas)
 
+                // Check if this source pixel belongs to any detected object
                 for (size_t i = 0; i < valid_dets.size(); ++i) {
                     const auto& d = valid_dets[i];
-                    int dx = d.bbox.x - d.bbox.w/2;
-                    int dy = d.bbox.y - d.bbox.h/2;
+                    int dx = d.bbox.x - d.bbox.w/2; // BBox Left
+                    int dy = d.bbox.y - d.bbox.h/2; // BBox Top
                     
+                    // Logic: If the source pixel is inside the YOLO box...
                     if (src_x >= dx && src_x < dx + d.bbox.w) {
                         if (src_y >= dy && src_y < dy + d.bbox.h) {
+                            // ...then update the Output Box boundaries.
                             auto& box = out_boxes[i];
                             if (x < box.min_x) box.min_x = x;
                             if (y < box.min_y) box.min_y = y;
                             if (x > box.max_x) box.max_x = x;
                             if (y > box.max_y) box.max_y = y;
                             box.found = true;
-                            break; 
+                            break; // Object found, move to next pixel
                         }
                     }
                 }
             }
         }
 
+        // --- STEP 4: Rendering ---
+        // Draw the calculated boxes on the output frame
         for (size_t i = 0; i < valid_dets.size(); ++i) {
             if (out_boxes[i].found) {
                 int bx = out_boxes[i].min_x;
@@ -466,17 +517,22 @@ void drawBBoxesOnOutput(Mat &out, Mat &map1, const vector<detection>& dets, View
                 int bw = out_boxes[i].max_x - out_boxes[i].min_x;
                 int bh = out_boxes[i].max_y - out_boxes[i].min_y;
                 
+                // Add padding to compensate for the scanning 'step' (20px)
                 int pad = step / 2;
                 bx = max(roi.x, bx - pad);
                 by = max(roi.y, by - pad);
                 bw += step;
                 bh += step;
 
+                // Boundary checks
                 if (bx + bw > roi.x + roi.width) bw = (roi.x + roi.width) - bx;
                 if (by + bh > roi.y + roi.height) bh = (roi.y + roi.height) - by;
 
+                // Only draw if the resulting box is big enough
                 if (bw > 10 && bh > 10) {
                     rectangle(out, Rect(bx, by, bw, bh), Scalar(0, 255, 0), 2);
+                    
+                    // Draw Label (Percentage)
                     putText(out, to_string((int)(valid_dets[i].prob*100))+"%", 
                             Point(bx, by > 20 ? by-5 : by+15), 
                             FONT_HERSHEY_SIMPLEX, 0.6, Scalar(0,255,0), 2);
@@ -485,16 +541,21 @@ void drawBBoxesOnOutput(Mat &out, Mat &map1, const vector<detection>& dets, View
         }
     }
 }
+
 void captureThread(string src) {
     string pipe;
     bool is_file = !isdigit(src[0]);
 
     if (!is_file) {
-        pipe = "v4l2src device=/dev/video" + src +
-               " ! video/x-raw, width=" + to_string(IN_W) + ", height=" + to_string(IN_H) + ", format=YUY2"
-               " ! queue max-size-buffers=2"
-               " ! appsink drop=true sync=false";
-        cout << "[CAPTURE] Mode: Camera Live" << endl;
+    pipe = "v4l2src device=/dev/video" + src +
+           " ! image/jpeg, width=" + to_string(IN_W) + ", height=" + to_string(IN_H) + 
+           " ! jpegdec"                 // Decode JPEG
+           " ! videoconvert"            // <--- WAJIB: Konverter warna otomatis
+           " ! video/x-raw, format=YUY2"// <--- WAJIB: Paksa output jadi YUY2 (sesuai code C++)
+           " ! queue max-size-buffers=2"
+           " ! appsink drop=true sync=false";
+           
+    cout << "[CAPTURE] Mode: Camera Live (MJPEG Corrected)" << endl;
     } else {
         pipe = "filesrc location=" + src +
                " ! decodebin ! queue"
@@ -709,6 +770,7 @@ void pipelineThread() {
         auto t_remap_end = chrono::steady_clock::now();
         stats_remap_ms.store(chrono::duration_cast<chrono::milliseconds>(t_remap_end - t_remap_start).count());
 
+        
         // === 4. Draw Boxes (CPU - Ringan) ===
         if (maps_ready && !map1_bufs[map_idx].data.empty()) {
             // Gambar kotak (baik hasil AI baru maupun hasil cache)
@@ -900,12 +962,12 @@ extern "C" {
         else if (active_view_id == 2) view3_##VAR = view3_##VAR + VAL; \
         else if (active_view_id == 3) pano_##VAR = pano_##VAR + VAL;
 
-    void on_btn_alpha_inc_clicked(GtkButton *b) { UPDATE_PTZ(alpha, 10.0f); }
-    void on_btn_alpha_dec_clicked(GtkButton *b) { UPDATE_PTZ(alpha, -10.0f); }
-    void on_btn_beta_inc_clicked(GtkButton *b)  { UPDATE_PTZ(beta, 10.0f); }
-    void on_btn_beta_dec_clicked(GtkButton *b)  { UPDATE_PTZ(beta, -10.0f); }
-    void on_btn_zoom_in_clicked(GtkButton *b)   { UPDATE_PTZ(zoom, 0.5f); }
-    void on_btn_zoom_out_clicked(GtkButton *b)  { UPDATE_PTZ(zoom, -0.5f); }
+    void on_btn_alpha_inc_clicked(GtkButton *b) { UPDATE_PTZ(alpha, 1.0f); }
+    void on_btn_alpha_dec_clicked(GtkButton *b) { UPDATE_PTZ(alpha, -1.0f); }
+    void on_btn_beta_inc_clicked(GtkButton *b)  { UPDATE_PTZ(beta, 1.0f); }
+    void on_btn_beta_dec_clicked(GtkButton *b)  { UPDATE_PTZ(beta, -1.0f); }
+    void on_btn_zoom_in_clicked(GtkButton *b)   { UPDATE_PTZ(zoom, 0.1f); }
+    void on_btn_zoom_out_clicked(GtkButton *b)  { UPDATE_PTZ(zoom, -0.1f); }
 }
 
 int main(int argc, char** argv) {
