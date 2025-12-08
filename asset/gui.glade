@@ -1,17 +1,21 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <interface>
   <requires lib="gtk+" version="3.20"/>
+  
   <object class="GtkWindow" id="main_window">
     <property name="can_focus">False</property>
-    <property name="title" translatable="yes">DRP-AI Moildev GUI</property>
+    <property name="title" translatable="yes">DRP-AI Moildev 3-View</property>
     <property name="default_width">1280</property>
     <property name="default_height">800</property>
     <signal name="destroy" handler="on_window_destroy" swapped="no"/>
+    <signal name="key-press-event" handler="on_key_press" swapped="no"/>
+    
     <child>
       <object class="GtkBox">
         <property name="visible">True</property>
         <property name="can_focus">False</property>
         <property name="orientation">vertical</property>
+        
         <child>
           <object class="GtkEventBox" id="event_box_img">
             <property name="visible">True</property>
@@ -34,56 +38,138 @@
             <property name="position">0</property>
           </packing>
         </child>
+        
         <child>
-          <object class="GtkButtonBox">
+          <object class="GtkBox">
             <property name="visible">True</property>
-            <property name="can_focus">False</property>
-            <property name="layout_style">spread</property>
+            <property name="orientation">horizontal</property>
+            <property name="spacing">10</property>
+            <property name="margin_top">5</property>
+            <property name="margin_bottom">5</property>
+            <property name="margin_start">5</property>
+            <property name="margin_end">5</property>
+            
             <child>
-              <object class="GtkButton" id="btn_main">
-                <property name="label" translatable="yes">MAIN</property>
+              <object class="GtkButtonBox">
                 <property name="visible">True</property>
-                <property name="can_focus">True</property>
-                <property name="receives_default">True</property>
-                <signal name="clicked" handler="on_btn_main_clicked" swapped="no"/>
+                <property name="layout_style">start</property>
+                <child>
+                  <object class="GtkButton" id="btn_main">
+                    <property name="label" translatable="yes">MODE: CAR VIEW</property>
+                    <property name="visible">True</property>
+                    <signal name="clicked" handler="on_btn_main_clicked" swapped="no"/>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkButton" id="btn_orig">
+                    <property name="label" translatable="yes">MODE: ORIGINAL</property>
+                    <property name="visible">True</property>
+                    <signal name="clicked" handler="on_btn_orig_clicked" swapped="no"/>
+                  </object>
+                </child>
               </object>
             </child>
+              <child>
+                  <object class="GtkButton" id="btn_triple">
+                    <property name="label" translatable="yes">MODE: 3x480</property>
+                    <property name="visible">True</property>
+                    <signal name="clicked" handler="on_btn_triple_clicked" swapped="no"/>
+                  </object>
+                </child>
             <child>
-              <object class="GtkButton" id="btn_orig">
-                <property name="label" translatable="yes">ORIGINAL</property>
+              <object class="GtkButtonBox">
                 <property name="visible">True</property>
-                <property name="can_focus">True</property>
-                <property name="receives_default">True</property>
-                <signal name="clicked" handler="on_btn_orig_clicked" swapped="no"/>
+                <property name="layout_style">center</property>
+                <child>
+                   <object class="GtkLabel">
+                      <property name="visible">True</property>
+                      <property name="label"> | PTZ: </property>
+                   </object>
+                </child>
+                <child>
+                  <object class="GtkButton" id="btn_zoom_in">
+                    <property name="label" translatable="yes">Zoom +</property>
+                    <property name="visible">True</property>
+                    <signal name="clicked" handler="on_btn_zoom_in_clicked" swapped="no"/>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkButton" id="btn_zoom_out">
+                    <property name="label" translatable="yes">Zoom -</property>
+                    <property name="visible">True</property>
+                    <signal name="clicked" handler="on_btn_zoom_out_clicked" swapped="no"/>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkButton" id="btn_alpha_inc">
+                    <property name="label" translatable="yes">Alpha +</property>
+                    <property name="visible">True</property>
+                    <signal name="clicked" handler="on_btn_alpha_inc_clicked" swapped="no"/>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkButton" id="btn_alpha_dec">
+                    <property name="label" translatable="yes">Alpha -</property>
+                    <property name="visible">True</property>
+                    <signal name="clicked" handler="on_btn_alpha_dec_clicked" swapped="no"/>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkButton" id="btn_beta_inc">
+                    <property name="label" translatable="yes">Beta +</property>
+                    <property name="visible">True</property>
+                    <signal name="clicked" handler="on_btn_beta_inc_clicked" swapped="no"/>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkButton" id="btn_beta_dec">
+                    <property name="label" translatable="yes">Beta -</property>
+                    <property name="visible">True</property>
+                    <signal name="clicked" handler="on_btn_beta_dec_clicked" swapped="no"/>
+                  </object>
+                </child>
               </object>
             </child>
+
             <child>
-              <object class="GtkButton" id="btn_pano">
-                <property name="label" translatable="yes">PANORAMA</property>
+              <object class="GtkButtonBox">
                 <property name="visible">True</property>
-                <property name="can_focus">True</property>
-                <property name="receives_default">True</property>
-                <signal name="clicked" handler="on_btn_pano_clicked" swapped="no"/>
+                <property name="layout_style">end</property>
+                
+                <child>
+                  <object class="GtkToggleButton" id="btn_pause">
+                    <property name="label" translatable="yes">PAUSE</property>
+                    <property name="visible">True</property>
+                    <signal name="toggled" handler="on_btn_pause_toggled" swapped="no"/>
+                  </object>
+                </child>
+
+                <child>
+                  <object class="GtkButton" id="btn_save">
+                    <property name="label" translatable="yes">SAVE CFG</property>
+                    <property name="visible">True</property>
+                    <signal name="clicked" handler="on_btn_save_clicked" swapped="no"/>
+                  </object>
+                </child>
+
+                <child>
+                  <object class="GtkButton" id="btn_flip_h">
+                    <property name="label" translatable="yes">Flip H</property>
+                    <property name="visible">True</property>
+                    <signal name="clicked" handler="on_btn_flip_h_clicked" swapped="no"/>
+                  </object>
+                </child>
+                
+                <child>
+                  <object class="GtkButton" id="btn_flip_v">
+                    <property name="label" translatable="yes">Flip V</property>
+                    <property name="visible">True</property>
+                    <signal name="clicked" handler="on_btn_flip_v_clicked" swapped="no"/>
+                  </object>
+                </child>
               </object>
             </child>
-            <child>
-              <object class="GtkButton" id="btn_grid">
-                <property name="label" translatable="yes">GRID</property>
-                <property name="visible">True</property>
-                <property name="can_focus">True</property>
-                <property name="receives_default">True</property>
-                <signal name="clicked" handler="on_btn_grid_clicked" swapped="no"/>
-              </object>
-            </child>
-            <child>
-              <object class="GtkButton" id="btn_ptz">
-                <property name="label" translatable="yes">PTZ (Single)</property>
-                <property name="visible">True</property>
-                <property name="can_focus">True</property>
-                <property name="receives_default">True</property>
-                <signal name="clicked" handler="on_btn_ptz_clicked" swapped="no"/>
-              </object>
-            </child>
+
           </object>
           <packing>
             <property name="expand">False</property>
