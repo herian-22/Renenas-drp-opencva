@@ -4,14 +4,14 @@
 
 /* Model DRP-AI (Direktori tempat Anda meletakkan file .so, .json, .params) */
 
-const std::string model_dir = "unicorn"; // Nama folder model Anda
+const std::string model_dir = "unicornv8m"; // Nama folder model Anda
 
 /* File teks label (satu nama kelas per baris) */
 
-const std::string label_list = "unicorn.txt";
+const std::string label_list = "unicornv8m.txt";
 
 /* Jumlah kelas yang dilatih model Anda */
-#define NUM_CLASS (5) 
+#define NUM_CLASS (2) 
 
 /* Dimensi Input Model */
 #define MODEL_IN_W (640)
@@ -19,8 +19,8 @@ const std::string label_list = "unicorn.txt";
 
 /* Ambang batas (Thresholds) */
 
-#define TH_PROB (0.25f) // Turunkan ke standar YOLO
-#define TH_NMS (0.45f)  // Biarkan standar
+#define TH_PROB (0.25f) // Turunkan ke 0.25 (Standar Default YOLOv8)
+#define TH_NMS (0.45f)  // Tetap 0.45 (Jangan diubah)
 
 /*****************************************
 * Definisi Aplikasi Kamera & Tampilan

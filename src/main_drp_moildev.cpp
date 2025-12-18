@@ -23,6 +23,7 @@
 #include "define.h"
 
 
+
 extern "C" {
 #include "moildev_resources.h" 
 }
@@ -105,6 +106,7 @@ vector<FrameBuffer> processPool;
 // Output Pool: BGR (3 Channel) hasil Remap untuk Display
 vector<FrameBuffer> outputPool;
 
+
 const int MAP_BUFFER_COUNT = 2;
 FrameBuffer map1_bufs[MAP_BUFFER_COUNT], map2_bufs[MAP_BUFFER_COUNT];
 
@@ -113,6 +115,10 @@ int w_idx_cap=0, r_idx_drp=0, w_idx_drp=0;
 
 // AI
 DrpAiYolo yolo;
+
+#define LUT_SIZE 2000          // Resolusi tabel (semakin besar semakin presisi)
+#define MAX_RADIAN 3.14159f
+
 
 // Mouse
 double last_mouse_x, last_mouse_y;
@@ -218,6 +224,21 @@ void loadConfig() {
     }
 }
 
+float rho_lut[LUT_SIZE];
+float rad_step = MAX_RADIAN / (LUT_SIZE - 1);
+
+void initRhoLUT() {
+    for (int i = 0; i < LUT_SIZE; i++) {
+        float a = i * rad_step;
+        float p0 = (float)PARA[0], p1 = (float)PARA[1], p2 = (float)PARA[2], 
+              p3 = (float)PARA[3], p4 = (float)PARA[4], p5 = (float)PARA[5];
+        
+        // Kalkulasi polinomial (Horner's Method) sekali saja saat startup
+        rho_lut[i] = (((((p0 * a + p1) * a + p2) * a + p3) * a + p4) * a + p5) * a;
+    }
+    cout << "[INIT] Rho LUT Generated. Size: " << LUT_SIZE << " entries." << endl;
+}
+
 // --- MOIL MATH & MAP UPDATE ---
 class MoilNative {
 public:
@@ -226,38 +247,72 @@ public:
         scale_x = (double)IN_W / ORG_W; scale_y = (double)IN_H / ORG_H;
         iCx = ORG_ICX * scale_x; iCy = ORG_ICY * scale_y;
     }
-    double getRho(double alpha) {
-        double p0=PARA[0], p1=PARA[1], p2=PARA[2], p3=PARA[3], p4=PARA[4], p5=PARA[5];
-        return (((((p0*alpha+p1)*alpha+p2)*alpha+p3)*alpha+p4)*alpha+p5)*alpha;
+    inline float getRhoFast(float alpha_rad) {
+        // Proteksi jika input di luar range
+        if (alpha_rad <= 0) return 0.0f;
+        if (alpha_rad >= MAX_RADIAN) return rho_lut[LUT_SIZE - 1];
+
+        // Hitung indeks berdasarkan rasio
+        int idx = (int)(alpha_rad / rad_step);
+        return rho_lut[idx];
     }
 
     void fillRegion(Mat &mx, Mat &my, Rect r, float alpha, float beta, float zoom, bool isPano, bool flip_h, bool flip_v) {
-        const double PI = 3.14159265358979323846;
+        // 1. Definisikan PI_F agar tidak error 'not declared'
+        const float PI_F = 3.1415926535f;
+        
+        // 2. PRE-CALCULATE KONSTANTA (Sangat penting di luar loop)
+        float ar = alpha * PI_F / 180.0f;
+        float br = beta * PI_F / 180.0f;
+        float cos_ar = cosf(ar);
+        float sin_ar = sinf(ar);
+        float cos_br = cosf(br);
+        float sin_br = sinf(br);
+        
+        // Hitung konstanta f (focal length virtual)
+        float f = r.width / (2.0f * tanf(30.0f * PI_F / 180.0f / zoom));
+
         #pragma omp parallel for collapse(2)
         for(int y=0; y<r.height; y++) {
             for(int x=0; x<r.width; x++) {
-                double rho, theta;
+                float rho, theta;
+                
                 if(isPano) {
-                    double nx=(double)x/r.width, ny=(double)y/r.height;
-                    theta=(nx-0.5)*2.0*PI + (beta * PI / 180.0);
-                    rho=getRho(ny*(alpha*PI/180.0));
+                    float nx = (float)x / r.width;
+                    float ny = (float)y / r.height;
+                    theta = (nx - 0.5f) * 2.0f * PI_F + br;
+                    
+                    // Menggunakan LUT: ny * ar adalah sudut alpha dalam radian
+                    rho = getRhoFast(ny * ar); 
                 } else {
-                    double f=r.width/(2.0*tan(30.0*PI/180.0/zoom));
-                    double ar=alpha*PI/180.0, br=beta*PI/180.0;
-                    double cx=x-r.width/2.0, cy=y-r.height/2.0;
-                    double x1=cx, y1=cy*cos(ar)-f*sin(ar), z1=cy*sin(ar)+f*cos(ar);
-                    double x2=x1*cos(br)-y1*sin(br), y2=x1*sin(br)+y1*cos(br), z2=z1;
-                    rho=getRho(atan2(sqrt(x2*x2+y2*y2),z2)); theta=atan2(y2,x2);
+                    float cx = (float)x - r.width / 2.0f;
+                    float cy = (float)y - r.height / 2.0f;
+                    
+                    // Transformasi koordinat 3D ke 2D Fisheye
+                    float x1 = cx;
+                    float y1 = cy * cos_ar - f * sin_ar;
+                    float z1 = cy * sin_ar + f * cos_ar;
+                    
+                    float x2 = x1 * cos_br - y1 * sin_br;
+                    float y2 = x1 * sin_br + y1 * cos_br;
+                    float z2 = z1;
+                    
+                    // Menggunakan LUT untuk mendapatkan rho dari sudut incident
+                    rho = getRhoFast(atan2f(sqrtf(x2*x2 + y2*y2), z2)); 
+                    theta = atan2f(y2, x2);
                 }
 
+                // Tentukan posisi target dengan mempertimbangkan Flip
                 int target_x = flip_h ? (r.width - 1 - x) : x;
                 int target_y = flip_v ? (r.height - 1 - y) : y;
                 int py = r.y + target_y;
                 int px = r.x + target_x;
 
-                if(px>=0 && px<mx.cols && py>=0 && py<mx.rows) {
-                    mx.at<float>(py,px)=(float)(iCx+(rho*scale_x)*cos(theta));
-                    my.at<float>(py,px)=(float)(iCy+(rho*scale_y)*sin(theta));
+                // Mapping ke koordinat asal kamera fisheye
+                if(px >= 0 && px < mx.cols && py >= 0 && py < mx.rows) {
+                    // iCx, iCy, scale_x, scale_y diambil dari class MoilNative
+                    mx.at<float>(py, px) = (float)(iCx + (rho * (float)scale_x) * cosf(theta));
+                    my.at<float>(py, px) = (float)(iCy + (rho * (float)scale_y) * sinf(theta));
                 }
             }
         }
@@ -360,12 +415,25 @@ void mapUpdateThread() {
                 l_pa = pano_alpha; l_pb = pano_beta; l_pfh = pano_flip_h; l_pfv = pano_flip_v;
                 break;
             }
+            // === MODE TRIPLE (LAYOUT SEPERTI GAMBAR) ===
             case MODE_TRIPLE: {
-                int split_w = CALC_W / 3; 
-                moil.fillRegion(mx_small, my_small, Rect(0, 0, split_w, CALC_H), view1_alpha, view1_beta, view1_zoom, false, view1_flip_h, view1_flip_v);
-                moil.fillRegion(mx_small, my_small, Rect(split_w, 0, split_w, CALC_H), view2_alpha, view2_beta, view2_zoom, false, view2_flip_h, view2_flip_v);
-                moil.fillRegion(mx_small, my_small, Rect(2*split_w, 0, split_w, CALC_H), view3_alpha, view3_beta, view3_zoom, false, view3_flip_h, view3_flip_v);
+                int sidebar_w = CALC_W / 3;      // Lebar kolom kiri (1/3 layar)
+                int main_w = CALC_W - sidebar_w; // Sisa lebar untuk kanan (2/3 layar)
+                int half_h = CALC_H / 2;         // Tinggi dibagi dua untuk kolom kiri
+
+                // 1. View 1: Kiri Atas
+                moil.fillRegion(mx_small, my_small, Rect(0, 0, sidebar_w, half_h), 
+                                view1_alpha, view1_beta, view1_zoom, false, view1_flip_h, view1_flip_v);
                 
+                // 2. View 2: Kiri Bawah
+                moil.fillRegion(mx_small, my_small, Rect(0, half_h, sidebar_w, half_h), 
+                                view2_alpha, view2_beta, view2_zoom, false, view2_flip_h, view2_flip_v);
+
+                // 3. View 3: Kanan Besar (Main View)
+                moil.fillRegion(mx_small, my_small, Rect(sidebar_w, 0, main_w, CALC_H), 
+                                view3_alpha, view3_beta, view3_zoom, false, view3_flip_h, view3_flip_v);
+                
+                // Update Cache logic (tetap sama)
                 l_v1a = view1_alpha; l_v1b = view1_beta; l_v1z = view1_zoom; l_v1fh = view1_flip_h; l_v1fv = view1_flip_v;
                 l_v2a = view2_alpha; l_v2b = view2_beta; l_v2z = view2_zoom; l_v2fh = view2_flip_h; l_v2fv = view2_flip_v;
                 l_v3a = view3_alpha; l_v3b = view3_beta; l_v3z = view3_zoom; l_v3fh = view3_flip_h; l_v3fv = view3_flip_v;
@@ -375,7 +443,11 @@ void mapUpdateThread() {
                 moil.fillStandard(mx_small, my_small, Rect(0, 0, CALC_W, CALC_H)); 
                 break;
             case MODE_PANORAMA: {
-                moil.fillRegion(mx_small, my_small, Rect(0, 0, CALC_W, CALC_H), pano_alpha.load(), pano_beta.load(), 0, true, pano_flip_h, pano_flip_v);
+                int split_y = CALC_H / 2; 
+                int start_y = CALC_H / 4; // Start di 1/4 layar agar posisi di Tengah
+
+                moil.fillRegion(mx_small, my_small, Rect(0, start_y, CALC_W, split_y), pano_alpha.load(), pano_beta.load(), 0, true, pano_flip_h, pano_flip_v);
+                
                 l_pa = pano_alpha; l_pb = pano_beta; l_pfh = pano_flip_h; l_pfv = pano_flip_v;
                 break;
             }
@@ -440,20 +512,36 @@ void drawBBoxesOnOutput(Mat &out, Mat &map1, const vector<detection>& dets, View
     // Instead of scanning the whole image, we define specific Regions of Interest (ROI)
     // based on the current ViewMode layout.
     vector<Rect> regions;
+    int split_y = OUT_H / 2;
+    int third_w = OUT_W / 3;
+    int start_y = OUT_H / 4; // For center-aligned modes
     if (mode == MODE_MAIN) {
         // Layout: Top half is Panorama, Bottom half is split into 3 views
-        int split_y = OUT_H / 2;
-        int third_w = OUT_W / 3;
+
         regions.push_back(Rect(0, 0, OUT_W, split_y));            // Top Panorama
         regions.push_back(Rect(0, split_y, third_w, split_y));    // Bottom Left
         regions.push_back(Rect(third_w, split_y, third_w, split_y)); // Bottom Center
         regions.push_back(Rect(2*third_w, split_y, third_w, split_y)); // Bottom Right
     } else if (mode == MODE_TRIPLE) {
-        // Layout: Screen split vertically into 3 columns
-        int w = OUT_W / 3;
-        regions.push_back(Rect(0, 0, w, OUT_H)); 
-        regions.push_back(Rect(w, 0, w, OUT_H)); 
-        regions.push_back(Rect(2*w, 0, w, OUT_H));
+        // === MODE TRIPLE (LAYOUT BARU) ===
+        int sidebar_w = OUT_W / 3;       // Lebar Sidebar Kiri
+        int main_w = OUT_W - sidebar_w;  // Lebar Utama Kanan
+        int half_h = OUT_H / 2;          // Tinggi separuh
+
+        // Region 1: Kiri Atas
+        regions.push_back(Rect(0, 0, sidebar_w, half_h)); 
+        
+        // Region 2: Kiri Bawah
+        regions.push_back(Rect(0, half_h, sidebar_w, half_h)); 
+        
+        // Region 3: Kanan Full (Besar)
+        regions.push_back(Rect(sidebar_w, 0, main_w, OUT_H));
+
+    } else if (mode == MODE_PANORAMA) {
+         // === MODE PANORAMA (CENTER) ===
+         // Y dimulai dari start_y (tengah)
+         regions.push_back(Rect(0, start_y, OUT_W, split_y));
+
     } else {
         // Full screen modes (Original, Single, Panorama Full)
         regions.push_back(Rect(0, 0, OUT_W, OUT_H));
@@ -854,7 +942,7 @@ extern "C" {
     }
     void on_btn_main_clicked(GtkButton *b) { current_mode = MODE_MAIN; }
     void on_btn_orig_clicked(GtkButton *b) { current_mode = MODE_ORIGINAL; }
-    void on_btn_pano_clicked(GtkButton *b) { current_mode = MODE_PANORAMA; }
+    // void on_btn_pano_clicked(GtkButton *b) { current_mode = MODE_PANORAMA; }
     void on_btn_grid_clicked(GtkButton *b) { current_mode = MODE_GRID; }
     void on_btn_ptz_clicked(GtkButton *b)  { current_mode = MODE_SINGLE; }
     void on_btn_triple_clicked(GtkButton *b) { current_mode = MODE_TRIPLE; }
@@ -879,7 +967,9 @@ extern "C" {
 
     void on_btn_pause_toggled(GtkToggleButton *b) { is_paused = gtk_toggle_button_get_active(b); }
     void on_btn_save_clicked(GtkButton *b) { saveConfig(); }
-
+    void on_btn_pano_clicked(GtkButton *b) { 
+            current_mode = MODE_PANORAMA;
+    }
     // === MOUSE DETEKSI ===
     gboolean on_mouse_down(GtkWidget *widget, GdkEventButton *event, gpointer user_data) { 
         if (event->button == 1) { 
@@ -1047,6 +1137,7 @@ int main(int argc, char** argv) {
         cout << "[INIT] YOLO Ready!" << endl;
         
         gtk_widget_show_all(main_window);
+        initRhoLUT();
 
         thread t1(captureThread, argv[1]); 
         this_thread::sleep_for(chrono::milliseconds(200)); 

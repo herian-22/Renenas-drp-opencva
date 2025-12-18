@@ -8,3 +8,7 @@ log
 exe-moilcvdrp
 sample_footage
 asset/gui copy.glade
+object-detection
+unicornv8m
+asset/yolov8n_pano
+unicorn_baru
