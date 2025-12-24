@@ -36,7 +36,7 @@ int DEFAULT_H = 960;
 int IN_W = DEFAULT_W; 
 int IN_H = DEFAULT_H;
 
-int OUT_W = 1024, OUT_H = 768; 
+int OUT_W = 1024, OUT_H = 600; 
 int SEL_RES_IDX = 0;
 
 struct Resolution { int w; int h; string name; };
@@ -173,21 +173,45 @@ void signal_handler(int signum) {
 void* lib_handle = nullptr;
 typedef int (*OCA_Activate_Func)(unsigned long*);
 void initDRP() {
-    char cwd[PATH_MAX]; 
-    if(getcwd(cwd, sizeof(cwd)) != NULL) setenv("DRP_EXE_PATH", cwd, 1);
-    // Load library OCA Renesas
-    lib_handle = dlopen("/usr/lib/aarch64-linux-gnu/renesas/libopencv_imgproc.so.4.1.0", RTLD_NOW | RTLD_GLOBAL | RTLD_NODELETE);
+    // 1. Setup Environment Variable
+    char cwd[PATH_MAX];
+    if (getcwd(cwd, sizeof(cwd)) != NULL)
+        setenv("DRP_EXE_PATH", cwd, 1);
+
+    // 2. LOAD LIBRARY (GABUNGAN IF-ELSE)
+    
+    // Prioritas 1: Biarkan Linux mencari otomatis (Paling Aman)
+    lib_handle = dlopen("libopencv_imgproc.so", RTLD_NOW | RTLD_GLOBAL);
+
+    // Prioritas 2: Jika gagal, coba cari di folder library 64-bit (Standar Yocto/Renesas)
     if (!lib_handle) {
-        cerr << "[ERROR] Failed to load libopencv_imgproc.so (OCA)! Check SDK." << endl;
-        exit(1);
+        lib_handle = dlopen("/usr/lib64/libopencv_imgproc.so", RTLD_NOW | RTLD_GLOBAL);
     }
+
+    // Prioritas 3: Jika masih gagal, coba path hardcoded lama Anda (Ubuntu style)
+    if (!lib_handle) {
+        lib_handle = dlopen("/usr/lib/aarch64-linux-gnu/renesas/libopencv_imgproc.so.4.1.0", RTLD_NOW | RTLD_GLOBAL | RTLD_NODELETE);
+    }
+
+    // 3. CEK HASIL LOAD
+    if (!lib_handle) {
+        // Jika semua gagal
+        cerr << "[WARN] OCA Library not found in any path! Running on CPU (Slower)." << endl;
+        return; // Jangan exit(1) biar aplikasi tetap jalan meski lambat
+    }
+
+    // 4. LOAD SIMBOL AKTIVASI
+    // Menggunakan nama simbol yang sudah kita validasi lewat 'strings' sebelumnya
     OCA_Activate_Func OCA_Activate_Ptr = (OCA_Activate_Func)dlsym(lib_handle, "_Z12OCA_ActivatePm");
+
     if (OCA_Activate_Ptr) {
-        unsigned long OCA_list[17] = {0}; OCA_list[0]=1; OCA_list[16]=1;
+        unsigned long OCA_list[17] = {0};
+        OCA_list[0]  = 1;
+        OCA_list[16] = 1;
         OCA_Activate_Ptr(OCA_list);
-        cout << "[INIT] DRP-OCA Activated! cv::cvt & cv::remap will be HW Accelerated." << endl;
+        cout << "[INIT] DRP-OCA Activated! (HW Acceleration ON)" << endl;
     } else {
-        cerr << "[ERROR] OCA_Activate symbol not found!" << endl;
+        cerr << "[ERROR] OCA_Activate symbol not found in the loaded library!" << endl;
     }
 }
 
@@ -635,23 +659,27 @@ void captureThread(string src) {
     bool is_file = !isdigit(src[0]);
 
     if (!is_file) {
-    pipe = "v4l2src device=/dev/video" + src +
-           " ! image/jpeg, width=" + to_string(IN_W) + ", height=" + to_string(IN_H) + 
-           " ! jpegdec"                 // Decode JPEG
-           " ! videoconvert"            // <--- WAJIB: Konverter warna otomatis
-           " ! video/x-raw, format=YUY2"// <--- WAJIB: Paksa output jadi YUY2 (sesuai code C++)
-           " ! queue max-size-buffers=2"
-           " ! appsink drop=true sync=false";
-           
-    cout << "[CAPTURE] Mode: Camera Live (MJPEG Corrected)" << endl;
+        // === MODE KAMERA (SAFE MODE) ===
+        // HAPUS 'framerate=30/1' yang memaksa. 
+        // Biarkan GStreamer negosiasi sendiri speed terbaik kamera.
+        pipe = "v4l2src device=/dev/video" + src +
+               " ! image/jpeg, width=" + to_string(IN_W) + 
+               ", height=" + to_string(IN_H) + 
+               // ", framerate=30/1" <--- INI BIANG KEROKNYA (HAPUS/KOMENTARI)
+               " ! jpegdec"                 
+               " ! videoconvert"            
+               " ! video/x-raw, format=YUY2"
+               " ! queue max-size-buffers=2 leaky=downstream" 
+               " ! appsink drop=true sync=false";
+               
+        cout << "[CAPTURE] Pipeline Safe Mode: " << pipe << endl;
     } else {
+        // Mode File
         pipe = "filesrc location=" + src +
                " ! decodebin ! queue"
                " ! videoconvert ! video/x-raw,format=YUY2"
                " ! appsink max-buffers=2 drop=true sync=true";
-        cout << "[CAPTURE] Mode: Video File (Follow Original FPS)" << endl;
     }
-
     VideoCapture *cap = new VideoCapture(pipe, CAP_GSTREAMER);
     if (!cap->isOpened()) { 
         cerr << "[ERROR] Gagal membuka source: " << src << endl;
@@ -739,7 +767,7 @@ gboolean update_gui_image(gpointer user_data)
     if (avail_h < 1) avail_h = screen_h;
 
     int dest_w = avail_w;   // FULL LEBAR
-    int dest_h = 1150;       // TINGGI DIKUNCI
+    int dest_h = avail_h;       // TINGGI DIKUNCI
 
     // std::cout << "Render size  : " << dest_w << " x " << dest_h << std::endl;
     // std::cout << "===========================\n" << std::endl;
