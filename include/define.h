@@ -4,14 +4,14 @@
 
 /* Model DRP-AI (Direktori tempat Anda meletakkan file .so, .json, .params) */
 
-const std::string model_dir = "unicornv8m"; // Nama folder model Anda
+const std::string model_dir = "unicornv8n"; // Nama folder model Anda
 
 /* File teks label (satu nama kelas per baris) */
 
 const std::string label_list = "unicornv8m.txt";
 
 /* Jumlah kelas yang dilatih model Anda */
-#define NUM_CLASS (2) 
+#define NUM_CLASS (5) 
 
 /* Dimensi Input Model */
 #define MODEL_IN_W (640)

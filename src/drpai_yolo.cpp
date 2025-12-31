@@ -78,7 +78,7 @@ std::vector<detection> DrpAiYolo::run_detection(const cv::Mat& input_image, AiSt
 }
 
 void DrpAiYolo::pre_process(const cv::Mat& img) {
-    // Padding color 114
+    // 1. Inisialisasi buffer dengan padding color (abu-abu 114)
     float pad_val = 114.0f / 255.0f;
     for (int i = 0; i < MODEL_IN_W * MODEL_IN_H * 3; i++) {
         cpu_input_buffer[i] = pad_val;
@@ -87,28 +87,43 @@ void DrpAiYolo::pre_process(const cv::Mat& img) {
     int w = img.cols;
     int h = img.rows;
     
-    // Menggunakan MODEL_IN_W dan MODEL_IN_H dari define.h
+    // 2. Hitung skala resize agar aspek rasio tetap terjaga
     float scale = min((float)MODEL_IN_W / w, (float)MODEL_IN_H / h);
     int new_w = w * scale;
     int new_h = h * scale;
     
+    // 3. Resize gambar
     cv::Mat resized;
     cv::resize(img, resized, cv::Size(new_w, new_h));
 
+    // 4. Hitung padding agar gambar berada di tengah
     int pad_x = (MODEL_IN_W - new_w) / 2;
     int pad_y = (MODEL_IN_H - new_h) / 2;
 
+    // 5. Pointer ke masing-masing channel planar (R, G, B) di buffer input model
     float* p_r = cpu_input_buffer;
     float* p_g = cpu_input_buffer + (MODEL_IN_W * MODEL_IN_H);
     float* p_b = cpu_input_buffer + (MODEL_IN_W * MODEL_IN_H * 2);
 
+    // 6. Loop pixel untuk normalisasi dan pemisahan channel (HWC -> CHW)
     for (int y = 0; y < new_h; y++) {
         for (int x = 0; x < new_w; x++) {
+            // Ambil pixel dari gambar yang sudah di-resize
             cv::Vec3b pixel = resized.at<cv::Vec3b>(y, x);
+            
+            // Hitung indeks di buffer tujuan (termasuk offset padding)
             int idx = (y + pad_y) * MODEL_IN_W + (x + pad_x);
-            p_b[idx] = pixel[0] / 255.0f; 
-            p_g[idx] = pixel[1] / 255.0f; 
-            p_r[idx] = pixel[2] / 255.0f; 
+
+            // === LOGIKA BARU (INPUT SUDAH RGB) ===
+            // Karena di main_drp_moildev.cpp kita sudah ubah konversi awal jadi COLOR_YUV2RGB,
+            // maka urutan pixel di cv::Mat sekarang adalah:
+            // pixel[0] = Red
+            // pixel[1] = Green
+            // pixel[2] = Blue
+            
+            p_r[idx] = pixel[0] / 255.0f; // Masukkan Red ke plane R
+            p_g[idx] = pixel[1] / 255.0f; // Masukkan Green ke plane G
+            p_b[idx] = pixel[2] / 255.0f; // Masukkan Blue ke plane B
         }
     }
 }

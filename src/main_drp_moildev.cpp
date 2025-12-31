@@ -16,6 +16,8 @@
 #include <linux/drpai.h>
 #include <fstream> 
 #include <signal.h>
+#include <sys/stat.h>
+
 
 #include "dmabuf.h" 
 #include "drpai_yolo.h" 
@@ -31,8 +33,8 @@ using namespace cv;
 using namespace std;
 
 // === KONFIGURASI INPUT ===
-int DEFAULT_W = 1280;
-int DEFAULT_H = 960;
+int DEFAULT_W = 800;
+int DEFAULT_H = 600;
 int IN_W = DEFAULT_W; 
 int IN_H = DEFAULT_H;
 
@@ -86,11 +88,14 @@ atomic<bool> maps_ready(false);
 GtkWidget *main_window, *img_display;
 
 // Stats
-atomic<double> stats_read_ms(0.0);
-atomic<double> stats_map_ms(0.0);
-atomic<double> stats_ai_ms(0.0);
-atomic<double> stats_remap_ms(0.0);
-atomic<double> stats_fps(0.0);
+
+atomic<double> stats_read_ms(0.0);   
+atomic<double> stats_cvt_ms(0.0);    
+atomic<double> stats_ai_ms(0.0);     
+atomic<double> stats_remap_ms(0.0);  
+atomic<double> stats_draw_ms(0.0);   
+atomic<double> stats_fps(0.0);     
+atomic<double> stats_map_ms(0.0); 
 
 // Buffers
 // BUFFER_SIZE = 3 untuk Double buffering yang aman
@@ -263,6 +268,76 @@ void initRhoLUT() {
     cout << "[INIT] Rho LUT Generated. Size: " << LUT_SIZE << " entries." << endl;
 }
 
+const string MAP_DIR = "maps_cache";
+// Pastikan folder maps ada
+void ensure_maps_folder() {
+    struct stat st = {0};
+    if (stat(MAP_DIR.c_str(), &st) == -1) {
+        mkdir(MAP_DIR.c_str(), 0777);
+    }
+}
+
+// Generate nama file unik berdasarkan parameter saat ini
+string generate_map_filename(ViewMode mode, int w, int h) {
+    stringstream ss;
+    ss << MAP_DIR << "/map_m" << mode << "_" << w << "x" << h;
+
+    // Helper lambda untuk membulatkan float agar nama file tidak aneh (presisi 1 desimal)
+    auto fmt = [](float f) { return (int)(f * 10); };
+    auto fmt_b = [](bool b) { return b ? 1 : 0; };
+
+    if (mode == MODE_SINGLE) {
+        ss << "_a" << fmt(cur_alpha) << "_b" << fmt(cur_beta) << "_z" << fmt(cur_zoom)
+           << "_fh" << fmt_b(cur_flip_h) << "_fv" << fmt_b(cur_flip_v);
+    } 
+    else if (mode == MODE_PANORAMA) {
+        ss << "_pa" << fmt(pano_alpha) << "_pb" << fmt(pano_beta)
+           << "_pfh" << fmt_b(pano_flip_h) << "_pfv" << fmt_b(pano_flip_v);
+    }
+    else if (mode == MODE_MAIN || mode == MODE_TRIPLE) {
+        // Untuk mode kompleks, kita hash semua view
+        // Pano (Only for MAIN)
+        if (mode == MODE_MAIN) {
+             ss << "_P" << fmt(pano_alpha) << "_" << fmt(pano_beta);
+        }
+        // View 1
+        ss << "_V1_" << fmt(view1_alpha) << "_" << fmt(view1_beta) << "_" << fmt(view1_zoom);
+        // View 2
+        ss << "_V2_" << fmt(view2_alpha) << "_" << fmt(view2_beta) << "_" << fmt(view2_zoom);
+        // View 3
+        ss << "_V3_" << fmt(view3_alpha) << "_" << fmt(view3_beta) << "_" << fmt(view3_zoom);
+    }
+    
+    ss << ".bin"; // Binary file agar cepat load/save
+    return ss.str();
+}
+
+// Simpan Mat ke File Binary (Sangat Cepat)
+void save_map_to_disk(const string& filename, cv::Mat& mx, cv::Mat& my) {
+    ofstream file(filename, ios::binary);
+    if (file.is_open()) {
+        size_t size = mx.total() * mx.elemSize();
+        file.write((char*)mx.data, size);
+        file.write((char*)my.data, size);
+        file.close();
+        // cout << "[CACHE] Saved new map: " << filename << endl;
+    }
+}
+
+// Load Mat dari File Binary
+bool load_map_from_disk(const string& filename, cv::Mat& mx, cv::Mat& my) {
+    ifstream file(filename, ios::binary);
+    if (file.is_open()) {
+        size_t size = mx.total() * mx.elemSize();
+        file.read((char*)mx.data, size);
+        file.read((char*)my.data, size);
+        file.close();
+        // cout << "[CACHE] Loaded map from disk!" << endl;
+        return true;
+    }
+    return false;
+}
+
 // --- MOIL MATH & MAP UPDATE ---
 class MoilNative {
 public:
@@ -359,6 +434,8 @@ public:
 void mapUpdateThread() {
     this_thread::sleep_for(chrono::milliseconds(800));
 
+    ensure_maps_folder();
+
     MoilNative moil;
     
     // === OPTIMASI DOWNSCALED MAP ===
@@ -390,7 +467,8 @@ void mapUpdateThread() {
         ViewMode mode = current_mode.load();
         bool changed = false;
 
-        // Cek apakah ada perubahan posisi/mode (Logic sama seperti original)
+        // --- DETEKSI PERUBAHAN ---
+        // (Logika ini sama persis dengan kode asli Anda, tidak perlu diubah)
         if(mode != last_mode) changed = true;
         else if (mode == MODE_SINGLE) {
             if(cur_alpha!=l_a || cur_beta!=l_b || cur_zoom!=l_z || cur_flip_h!=l_fh || cur_flip_v!=l_fv) changed = true;
@@ -410,87 +488,84 @@ void mapUpdateThread() {
                view3_alpha!=l_v3a || view3_beta!=l_v3b || view3_zoom!=l_v3z || view3_flip_h!=l_v3fh || view3_flip_v!=l_v3fv) changed = true;
         }
 
-        // Jika tidak ada perubahan, tidur sebentar (Hemat CPU)
+        // JIKA TIDAK ADA PERUBAHAN, TIDUR (Hemat CPU)
         if (maps_ready && !changed) { 
             this_thread::sleep_for(chrono::milliseconds(20)); continue; 
         }
 
+        // === MULAI PROSES PEMBUATAN MAP ===
         auto t1 = chrono::steady_clock::now();
         int back_idx = (active_map_idx.load() + 1) % MAP_BUFFER_COUNT;
-        
-        // Reset buffer kecil
-        mx_small.setTo(Scalar(-1)); my_small.setTo(Scalar(-1));
 
-        // Kalkulasi di koordinat KECIL (CALC_W x CALC_H)
-        switch(mode) {
-            case MODE_MAIN: {
-                int split_y = CALC_H / 2;
-                int third_w = CALC_W / 3;
-                
-                moil.fillRegion(mx_small, my_small, Rect(0, 0, CALC_W, split_y), pano_alpha.load(), pano_beta.load(), 0, true, pano_flip_h, pano_flip_v);
-                moil.fillRegion(mx_small, my_small, Rect(0, split_y, third_w, split_y), view1_alpha, view1_beta, view1_zoom, false, view1_flip_h, view1_flip_v);
-                moil.fillRegion(mx_small, my_small, Rect(third_w, split_y, third_w, split_y), view2_alpha, view2_beta, view2_zoom, false, view2_flip_h, view2_flip_v);
-                moil.fillRegion(mx_small, my_small, Rect(2*third_w, split_y, third_w, split_y), view3_alpha, view3_beta, view3_zoom, false, view3_flip_h, view3_flip_v);
-                
-                // Update Cache
-                l_v1a = view1_alpha; l_v1b = view1_beta; l_v1z = view1_zoom; l_v1fh = view1_flip_h; l_v1fv = view1_flip_v;
-                l_v2a = view2_alpha; l_v2b = view2_beta; l_v2z = view2_zoom; l_v2fh = view2_flip_h; l_v2fv = view2_flip_v;
-                l_v3a = view3_alpha; l_v3b = view3_beta; l_v3z = view3_zoom; l_v3fh = view3_flip_h; l_v3fv = view3_flip_v;
-                l_pa = pano_alpha; l_pb = pano_beta; l_pfh = pano_flip_h; l_pfv = pano_flip_v;
-                break;
-            }
-            // === MODE TRIPLE (LAYOUT SEPERTI GAMBAR) ===
-            case MODE_TRIPLE: {
-                int sidebar_w = CALC_W / 3;      // Lebar kolom kiri (1/3 layar)
-                int main_w = CALC_W - sidebar_w; // Sisa lebar untuk kanan (2/3 layar)
-                int half_h = CALC_H / 2;         // Tinggi dibagi dua untuk kolom kiri
+        // 1. Generate Nama File Unik berdasarkan parameter saat ini
+        string map_fname = generate_map_filename(mode, CALC_W, CALC_H);
 
-                // 1. View 1: Kiri Atas
-                moil.fillRegion(mx_small, my_small, Rect(0, 0, sidebar_w, half_h), 
-                                view1_alpha, view1_beta, view1_zoom, false, view1_flip_h, view1_flip_v);
-                
-                // 2. View 2: Kiri Bawah
-                moil.fillRegion(mx_small, my_small, Rect(0, half_h, sidebar_w, half_h), 
-                                view2_alpha, view2_beta, view2_zoom, false, view2_flip_h, view2_flip_v);
+        // 2. Cek apakah file sudah ada di Cache?
+        bool loaded_from_cache = load_map_from_disk(map_fname, mx_small, my_small);
 
-                // 3. View 3: Kanan Besar (Main View)
-                moil.fillRegion(mx_small, my_small, Rect(sidebar_w, 0, main_w, CALC_H), 
-                                view3_alpha, view3_beta, view3_zoom, false, view3_flip_h, view3_flip_v);
-                
-                // Update Cache logic (tetap sama)
-                l_v1a = view1_alpha; l_v1b = view1_beta; l_v1z = view1_zoom; l_v1fh = view1_flip_h; l_v1fv = view1_flip_v;
-                l_v2a = view2_alpha; l_v2b = view2_beta; l_v2z = view2_zoom; l_v2fh = view2_flip_h; l_v2fv = view2_flip_v;
-                l_v3a = view3_alpha; l_v3b = view3_beta; l_v3z = view3_zoom; l_v3fh = view3_flip_h; l_v3fv = view3_flip_v;
-                break;
-            }
-            case MODE_ORIGINAL: 
-                moil.fillStandard(mx_small, my_small, Rect(0, 0, CALC_W, CALC_H)); 
-                break;
-            case MODE_PANORAMA: {
-                int split_y = CALC_H / 2; 
-                int start_y = CALC_H / 4; // Start di 1/4 layar agar posisi di Tengah
+        if (loaded_from_cache) {
+            // [JALUR CEPAT] Load dari disk (IO bound, CPU ringan)
+            // Tidak perlu update variabel cache l_a, l_b dll karena kita tidak menghitungnya.
+            // Tapi kita perlu update agar loop berikutnya mendeteksi 'tidak berubah'
+            // (Disederhanakan: kita update variabel cache di bawah)
+        } else {
+            // [JALUR LAMBAT] Kalkulasi Matematika (CPU bound)
+            // Reset buffer
+            mx_small.setTo(Scalar(-1)); my_small.setTo(Scalar(-1));
 
-                moil.fillRegion(mx_small, my_small, Rect(0, start_y, CALC_W, split_y), pano_alpha.load(), pano_beta.load(), 0, true, pano_flip_h, pano_flip_v);
-                
-                l_pa = pano_alpha; l_pb = pano_beta; l_pfh = pano_flip_h; l_pfv = pano_flip_v;
-                break;
+            switch(mode) {
+                case MODE_MAIN: {
+                    int split_y = CALC_H / 2;
+                    int third_w = CALC_W / 3;
+                    moil.fillRegion(mx_small, my_small, Rect(0, 0, CALC_W, split_y), pano_alpha.load(), pano_beta.load(), 0, true, pano_flip_h, pano_flip_v);
+                    moil.fillRegion(mx_small, my_small, Rect(0, split_y, third_w, split_y), view1_alpha, view1_beta, view1_zoom, false, view1_flip_h, view1_flip_v);
+                    moil.fillRegion(mx_small, my_small, Rect(third_w, split_y, third_w, split_y), view2_alpha, view2_beta, view2_zoom, false, view2_flip_h, view2_flip_v);
+                    moil.fillRegion(mx_small, my_small, Rect(2*third_w, split_y, third_w, split_y), view3_alpha, view3_beta, view3_zoom, false, view3_flip_h, view3_flip_v);
+                    break;
+                }
+                case MODE_TRIPLE: {
+                    int sidebar_w = CALC_W / 3;
+                    int main_w = CALC_W - sidebar_w;
+                    int half_h = CALC_H / 2;
+                    moil.fillRegion(mx_small, my_small, Rect(0, 0, sidebar_w, half_h), view1_alpha, view1_beta, view1_zoom, false, view1_flip_h, view1_flip_v);
+                    moil.fillRegion(mx_small, my_small, Rect(0, half_h, sidebar_w, half_h), view2_alpha, view2_beta, view2_zoom, false, view2_flip_h, view2_flip_v);
+                    moil.fillRegion(mx_small, my_small, Rect(sidebar_w, 0, main_w, CALC_H), view3_alpha, view3_beta, view3_zoom, false, view3_flip_h, view3_flip_v);
+                    break;
+                }
+                case MODE_ORIGINAL: 
+                    moil.fillStandard(mx_small, my_small, Rect(0, 0, CALC_W, CALC_H)); 
+                    break;
+                case MODE_PANORAMA: {
+                    int split_y = CALC_H / 2; 
+                    int start_y = CALC_H / 4;
+                    moil.fillRegion(mx_small, my_small, Rect(0, start_y, CALC_W, split_y), pano_alpha.load(), pano_beta.load(), 0, true, pano_flip_h, pano_flip_v);
+                    break;
+                }
+                case MODE_GRID: {
+                    // Grid biasanya statis, tapi tidak apa-apa di-cache juga
+                    int bw = CALC_W/2, bh = CALC_H/2;
+                    moil.fillRegion(mx_small, my_small, Rect(0, 0, bw, bh), 0, 0, 2.0, false, false, false);
+                    moil.fillRegion(mx_small, my_small, Rect(bw, 0, bw, bh), 45, 0, 2.0, false, false, false);
+                    moil.fillRegion(mx_small, my_small, Rect(0, bh, bw, bh), 45, -90, 2.0, false, false, false);
+                    moil.fillRegion(mx_small, my_small, Rect(bw, bh, bw, bh), 45, 90, 2.0, false, false, false);
+                    break;
+                }
+                case MODE_SINGLE: {
+                    moil.fillRegion(mx_small, my_small, Rect(0, 0, CALC_W, CALC_H), cur_alpha, cur_beta, cur_zoom, false, cur_flip_h, cur_flip_v);
+                    break;
+                }
             }
-            case MODE_GRID: {
-                int bw = CALC_W/2, bh = CALC_H/2;
-                moil.fillRegion(mx_small, my_small, Rect(0, 0, bw, bh), 0, 0, 2.0, false, false, false);
-                moil.fillRegion(mx_small, my_small, Rect(bw, 0, bw, bh), 45, 0, 2.0, false, false, false);
-                moil.fillRegion(mx_small, my_small, Rect(0, bh, bw, bh), 45, -90, 2.0, false, false, false);
-                moil.fillRegion(mx_small, my_small, Rect(bw, bh, bw, bh), 45, 90, 2.0, false, false, false);
-                break;
-            }
-            case MODE_SINGLE: {
-                // Kalkulasi di buffer kecil saja agar konsisten
-                moil.fillRegion(mx_small, my_small, Rect(0, 0, CALC_W, CALC_H), cur_alpha, cur_beta, cur_zoom, false, cur_flip_h, cur_flip_v);
-                l_a = cur_alpha; l_b = cur_beta; l_z = cur_zoom; l_fh = cur_flip_h; l_fv = cur_flip_v;
-                break;
-            }
+
+            // SIMPAN HASIL KALKULASI KE DISK AGAR NANTI CEPAT
+            save_map_to_disk(map_fname, mx_small, my_small);
         }
         
+        l_a = cur_alpha; l_b = cur_beta; l_z = cur_zoom; l_fh = cur_flip_h; l_fv = cur_flip_v;
+        l_pa = pano_alpha; l_pb = pano_beta; l_pfh = pano_flip_h; l_pfv = pano_flip_v;
+        l_v1a = view1_alpha; l_v1b = view1_beta; l_v1z = view1_zoom; l_v1fh = view1_flip_h; l_v1fv = view1_flip_v;
+        l_v2a = view2_alpha; l_v2b = view2_beta; l_v2z = view2_zoom; l_v2fh = view2_flip_h; l_v2fv = view2_flip_v;
+        l_v3a = view3_alpha; l_v3b = view3_beta; l_v3z = view3_zoom; l_v3fh = view3_flip_h; l_v3fv = view3_flip_v;
+
         // --- PROSES RESIZE (UPSCALING MAP) ---
         // Membesarkan Map Kecil -> Map Besar
         // INTER_LINEAR wajib dipakai agar hasil lengkungannya halus (tidak kotak-kotak)
@@ -689,6 +764,9 @@ void captureThread(string src) {
 
     Mat temp;
     while (isRunning) {
+
+        auto t_read_start = chrono::steady_clock::now();
+
         if (!cap->read(temp) || temp.empty()) { 
             if (is_file) {
                 cout << "[CAPTURE] Video Ended. Replaying..." << endl;
@@ -696,7 +774,10 @@ void captureThread(string src) {
             }
             continue; 
         }
-
+        auto t_read_end = chrono::steady_clock::now();
+        // Simpan ke variabel global
+        std::chrono::duration<double, std::milli> ms_read = t_read_end - t_read_start;
+        stats_read_ms.store(ms_read.count());
         if (temp.cols != IN_W || temp.rows != IN_H) {
             resize(temp, temp, Size(IN_W, IN_H));
         }
@@ -736,7 +817,6 @@ void drawDetectionsOnInput(Mat &img, const vector<detection>& dets) {
 
 void drawInfoBox(Mat &img) {}
 
-
 gboolean update_gui_image(gpointer user_data)
 {
     int idx = (int)(intptr_t)user_data;
@@ -746,32 +826,62 @@ gboolean update_gui_image(gpointer user_data)
     }
 
     Mat &src = outputPool[idx].data;
-
-    // Ambil ukuran widget
+    
+    // 1. Ambil ukuran widget yang tersedia
     int avail_w = gtk_widget_get_allocated_width(img_display);
     int avail_h = gtk_widget_get_allocated_height(img_display);
+    
+    // 2. Jika widget belum valid, gunakan ukuran layar sebagai fallback
+    if (avail_w < 1 || avail_h < 1) {
+        GdkScreen *screen = gdk_screen_get_default();
+        avail_w = gdk_screen_get_width(screen);
+        avail_h = gdk_screen_get_height(screen);
+    }
+    
+    // 3. Tentukan area maksimal untuk gambar
+    //    Kurangi dengan lebar sidebar/panel kontrol jika ada
+    const int SIDEBAR_WIDTH = 320;
+    int max_w = avail_w - SIDEBAR_WIDTH;
+    int max_h = avail_h;
+    
+    // 4. Pastikan area tidak terlalu kecil
+    //    Minimal 800px untuk lebar, dan 600px untuk tinggi
+    if (max_w < 800) max_w = 800;
+    if (max_h < 600) max_h = 600;
+    
+    // 5. Hitung skala agar gambar fit di area (jaga aspect ratio)
+    float scale_w = (float)max_w / src.cols;
+    float scale_h = (float)max_h / src.rows;
+    
+    // Pilih skala terkecil agar gambar tidak keluar dari area
+    float scale = (scale_w < scale_h) ? scale_w : scale_h;
+    
+    // 6. TAMBAHAN: Pastikan skala tidak terlalu kecil untuk gambar kecil
+    //    Jika gambar sumber kecil (misal 480p), berikan skala minimum
+    float min_scale = 1.0f; // Minimal 1:1 untuk gambar kecil
+    if (src.cols <= 640) { // Jika lebar gambar <= 640px
+        min_scale = 1.5f; // Perbesar sedikit agar tidak terlalu kecil
+    }
+    
+    // Terapkan batasan skala minimum
+    if (scale < min_scale) scale = min_scale;
+    
+    // 7. Hitung ukuran akhir
+    int dest_w = (int)(src.cols * scale);
+    int dest_h = (int)(src.rows * scale);
+    
+    // 8. Pastikan tidak melebihi area maksimal
+    if (dest_w > max_w) {
+        dest_w = max_w;
+        dest_h = (int)(src.rows * ((float)max_w / src.cols));
+    }
+    
+    if (dest_h > max_h) {
+        dest_h = max_h;
+        dest_w = (int)(src.cols * ((float)max_h / src.rows));
+    }
 
-    // Ambil ukuran layar asli
-    GdkScreen *screen = gdk_screen_get_default();
-    int screen_w = gdk_screen_get_width(screen);
-    int screen_h = gdk_screen_get_height(screen);
-
-    // // Log semua ukuran
-    // std::cout << "\n=== DISPLAY SIZE INFO ===" << std::endl;
-    // std::cout << "Screen size  : " << screen_w << " x " << screen_h << std::endl;
-    // std::cout << "Widget size  : " << avail_w << " x " << avail_h << std::endl;
-    // std::cout << "Source (Mat) : " << src.cols << " x " << src.rows << std::endl;
-
-    // Kalau widget belum valid, pakai ukuran layar
-    if (avail_w < 1) avail_w = screen_w;
-    if (avail_h < 1) avail_h = screen_h;
-
-    int dest_w = avail_w;   // FULL LEBAR
-    int dest_h = avail_h;       // TINGGI DIKUNCI
-
-    // std::cout << "Render size  : " << dest_w << " x " << dest_h << std::endl;
-    // std::cout << "===========================\n" << std::endl;
-
+    // Buat pixbuf dari data gambar
     GdkPixbuf *pixbuf = gdk_pixbuf_new_from_data(
         src.data,
         GDK_COLORSPACE_RGB,
@@ -785,15 +895,27 @@ gboolean update_gui_image(gpointer user_data)
     );
 
     if (pixbuf) {
-        GdkPixbuf *scaled = gdk_pixbuf_scale_simple(
-            pixbuf,
-            dest_w,
-            dest_h,
-            GDK_INTERP_NEAREST
-        );
-
-        gtk_image_set_from_pixbuf(GTK_IMAGE(img_display), scaled);
-        g_object_unref(scaled);
+        // Cek apakah resize diperlukan
+        if (dest_w == src.cols && dest_h == src.rows) {
+            // Ukuran sama, langsung tampilkan
+            gtk_image_set_from_pixbuf(GTK_IMAGE(img_display), pixbuf);
+        } else {
+            // Resize dengan interpolasi yang lebih baik untuk pembesaran
+            GdkInterpType interp = GDK_INTERP_NEAREST;
+            if (scale > 1.0f) {
+                // Jika memperbesar, gunakan bilinear agar lebih smooth
+                interp = GDK_INTERP_BILINEAR;
+            }
+            
+            GdkPixbuf *scaled = gdk_pixbuf_scale_simple(
+                pixbuf,
+                dest_w,
+                dest_h,
+                interp
+            );
+            gtk_image_set_from_pixbuf(GTK_IMAGE(img_display), scaled);
+            g_object_unref(scaled);
+        }
         g_object_unref(pixbuf);
     }
 
@@ -808,7 +930,6 @@ void pipelineThread() {
     int frame_count = 0; 
     auto last_fps_time = chrono::steady_clock::now();
 
-    // Variable untuk menyimpan hasil deteksi frame sebelumnya (untuk mode Kamera)
     vector<detection> cached_results;
     int ai_skip_counter = 0; 
 
@@ -838,45 +959,36 @@ void pipelineThread() {
         AiStats ai_stats;
         vector<detection> results;
         
-        // === 1. Convert YUYV (Cam) -> BGR (Process Buffer) ===
-        // Selalu dijalankan karena dibutuhkan untuk Remap (Display) dan AI
-        auto t_conv_start = chrono::steady_clock::now();
-        cv::cvtColor(inputPool[idx_in].data, processPool[idx_in].data, COLOR_YUV2BGR_YUY2);
+        // === 1. Convert YUYV -> BGR (KOTAK MERAH 2) ===
+        auto t_cvt_start = chrono::steady_clock::now();
+        
+        cv::cvtColor(inputPool[idx_in].data, processPool[idx_in].data, COLOR_YUV2RGB_YUY2);
         buffer_flush_dmabuf(processPool[idx_in].dbuf.idx, processPool[idx_in].dbuf.size);
         
-        // === 2. Run DRP-AI YOLO (LOGIKA BARU) ===
-        bool run_inference = true;
+        auto t_cvt_end = chrono::steady_clock::now();
+        std::chrono::duration<double, std::milli> ms_cvt = t_cvt_end - t_cvt_start;
+        stats_cvt_ms.store(ms_cvt.count());
 
+        
+        // === 2. Run DRP-AI YOLO (KOTAK HIJAU 1) ===
+        bool run_inference = true;
         if (IS_CAMERA_MODE) {
-            // --- MODE KAMERA (LIGHTER MODE) ---
-            // Kita skip AI inference untuk mengejar 30 FPS.
-            // Jalankan AI hanya setiap 3 frame (Frame 0: Run, Frame 1: Skip, Frame 2: Skip)
-            if (ai_skip_counter % 3 != 0) {
-                run_inference = false;
-            }
+            if (ai_skip_counter % 1 != 0) run_inference = false;
             ai_skip_counter++;
         } else {
-            // --- MODE VIDEO FILE (HEAVY MODE) ---
-            // Jalankan AI di setiap frame seperti kode asli
             run_inference = true;
         }
 
         if (run_inference) {
-            // Berat: Jalankan DRP-AI
             results = yolo.run_detection(processPool[idx_in].data, ai_stats);
-            
-            // Simpan hasil untuk frame berikutnya yang di-skip
             cached_results = results; 
             stats_ai_ms.store(ai_stats.total);
         } else {
-            // Ringan: Pakai hasil frame sebelumnya (tanpa membebani DRP-AI)
             results = cached_results;
-            
-            // Set stats 0 atau nilai terakhir agar log tidak bingung
             ai_stats.total = 0; 
         }
 
-        // === 3. Remap Fisheye -> Output Buffer (Display) ===
+        // === 3. Remap Fisheye (KOTAK HIJAU 2) ===
         auto t_remap_start = chrono::steady_clock::now();
         if (maps_ready && !map1_bufs[map_idx].data.empty()) {
             cv::remap(processPool[idx_in].data, outputPool[idx_out].data, map1_bufs[map_idx].data, map2_bufs[map_idx].data, INTER_NEAREST, BORDER_CONSTANT);
@@ -884,19 +996,23 @@ void pipelineThread() {
             processPool[idx_in].data.copyTo(outputPool[idx_out].data); 
         }
         auto t_remap_end = chrono::steady_clock::now();
-        stats_remap_ms.store(chrono::duration_cast<chrono::milliseconds>(t_remap_end - t_remap_start).count());
+        std::chrono::duration<double, std::milli> ms_remap = t_remap_end - t_remap_start;
+        stats_remap_ms.store(ms_remap.count());
 
         
-        // === 4. Draw Boxes (CPU - Ringan) ===
+        // === 4. Draw Boxes (KOTAK MERAH 3) ===
+        auto t_draw_start = chrono::steady_clock::now();
         if (maps_ready && !map1_bufs[map_idx].data.empty()) {
-            // Gambar kotak (baik hasil AI baru maupun hasil cache)
             drawBBoxesOnOutput(outputPool[idx_out].data, map1_bufs[map_idx].data, results, current_mode.load());
         }
-
-        // Convert ke RGB untuk Display GTK
-        cv::cvtColor(outputPool[idx_out].data, outputPool[idx_out].data, COLOR_BGR2RGB);
+        // (Opsional: Jika Anda mengaktifkan cvtColor BGR->RGB untuk display, masukkan ke sini juga)
         
-        // --- FPS COUNTER ---
+        auto t_draw_end = chrono::steady_clock::now();
+        std::chrono::duration<double, std::milli> ms_draw = t_draw_end - t_draw_start;
+        stats_draw_ms.store(ms_draw.count());
+
+
+        // --- FPS & LOGGING (FULL CALCULATION) ---
         frame_count++;
         auto now = chrono::steady_clock::now();
         double elapsed_ms = chrono::duration_cast<chrono::milliseconds>(now - last_fps_time).count();
@@ -915,30 +1031,32 @@ void pipelineThread() {
                 case MODE_TRIPLE: mode_name = "Triple"; break;
             }
 
-            printf("\n=================[ PERFORMANCE LOG ]=================\n");
+            // --- PERHITUNGAN TOTAL SEMUA KOTAK ---
+            double t_read = stats_read_ms.load();
+            double t_cvt  = stats_cvt_ms.load();
+            double t_ai   = stats_ai_ms.load();
+            double t_remap= stats_remap_ms.load();
+            double t_draw = stats_draw_ms.load();
+
+            double total_pipeline_latency = t_read + t_cvt + t_ai + t_remap + t_draw;
+
+            printf("\n=================[ FULL PERFORMANCE LOG ]=================\n");
             printf(" [GENERAL]\n");
-            printf("  > Source    : %s\n", IS_CAMERA_MODE ? "Camera (Lighter Mode)" : "Video File (Full AI)");
+            printf("  > Source    : %s\n", IS_CAMERA_MODE ? "Camera" : "Video File");
             printf("  > Mode      : %s\n", mode_name.c_str());
             printf("  > FPS       : %d\n", (int)current_fps);
             printf("  > Input     : %dx%d\n", IN_W, IN_H);
             printf("  > Output    : %dx%d\n", OUT_W, OUT_H);
-            printf(" ----------------------------------------------------\n");
-            printf(" [PIPELINE LATENCY]\n");
-            printf("  > Read      : %.2f ms\n", stats_read_ms.load());
-            printf("  > Map       : %.2f ms\n", stats_map_ms.load());
-            printf("  > Remap     : %.2f ms\n", stats_remap_ms.load());
-            // Total waktu sedikit bias jika AI diskip, tapi ini memberi gambaran latency per frame display
-            printf("  > Total     : %.2f ms\n", stats_read_ms.load() + stats_ai_ms.load() + stats_remap_ms.load());
-            printf(" ----------------------------------------------------\n");
-            printf(" [AI DETAILS]\n");
-            if (IS_CAMERA_MODE && !run_inference) {
-                 printf("  > Status    : CACHED (Skipped for Performance)\n");
-            } else {
-                 printf("  > Status    : RUNNING\n");
-                 printf("  > AI Total  : %.2f ms\n", ai_stats.total);
-                 printf("  > Objects   : %d\n", ai_stats.count);
-            }
-            printf("=====================================================\n");
+            printf(" ---------------------------------------------------------\n");
+            printf(" [LATENCY BREAKDOWN (RED + GREEN SCOPES)]\n");
+            printf("  1. Cam Read : %6.2f ms  [Red]\n", t_read);
+            printf("  2. CvtColor : %6.2f ms  [Red]\n", t_cvt);
+            printf("  3. YOLO AI  : %6.2f ms  [Green]\n", t_ai);
+            printf("  4. Remap    : %6.2f ms  [Green]\n", t_remap);
+            printf("  5. Drawing  : %6.2f ms  [Red]\n", t_draw);
+            printf("  --------------------------------------\n");
+            printf("  > GRAND TOTAL: %6.2f ms\n", total_pipeline_latency);
+            printf(" ---------------------------------------------------------\n");
             fflush(stdout);
         }
 
