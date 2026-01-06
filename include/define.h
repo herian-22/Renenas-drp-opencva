@@ -19,8 +19,8 @@ const std::string label_list = "unicornv8m.txt";
 
 /* Ambang batas (Thresholds) */
 
-#define TH_PROB (0.25f) // Turunkan ke 0.25 (Standar Default YOLOv8)
-#define TH_NMS (0.45f)  // Tetap 0.45 (Jangan diubah)
+#define TH_PROB (0.25f) 
+#define TH_NMS (0.45f)  
 
 /*****************************************
 * Definisi Aplikasi Kamera & Tampilan

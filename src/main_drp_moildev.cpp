@@ -973,7 +973,7 @@ void pipelineThread() {
         // === 2. Run DRP-AI YOLO (KOTAK HIJAU 1) ===
         bool run_inference = true;
         if (IS_CAMERA_MODE) {
-            if (ai_skip_counter % 1 != 0) run_inference = false;
+            if (ai_skip_counter % 5 != 0) run_inference = false;
             ai_skip_counter++;
         } else {
             run_inference = true;
