@@ -17,6 +17,7 @@
 #include <fstream> 
 #include <signal.h>
 #include <sys/stat.h>
+#include <sstream>
 
 
 #include "dmabuf.h" 
@@ -45,17 +46,44 @@ struct Resolution { int w; int h; string name; };
 
 const vector<Resolution> BENCHMARK_RES = {
     {640, 480,  "VGA (480p)"},
-    {1024, 768,  "0.8 MP (HD)"},    
-    {1600, 1200, "2.0 MP (FHD)"},   
-    {1920, 1080, "2.0 MP (1080p)"}, 
-    {2592, 1944, "5.0 MP (2K/5MP)"},
+    {1024, 768, "5.0 MP (xVga)"},
+    {1280, 720,  "0.8 MP (HD)"},    
+    {1920, 1080, "2.0 MP (FHD)"},   
+    {2592, 1944, "2.0 MP (2K)"}, 
+   
     
 };
 
 // Fisheye Params
-const double PARA[] = {0.0, 0.0, -35.475, 73.455, -41.392, 499.33};
-const double ORG_W = 2592.0, ORG_H = 1944.0; 
-const double ORG_ICX = 1205.0, ORG_ICY = 966.0;
+double PARA[6] = {0.0, 0.0, -35.475, 73.455, -41.392, 499.33}; 
+double ORG_W = 2592.0, ORG_H = 1944.0; 
+double ORG_ICX = 1205.0, ORG_ICY = 966.0;
+
+void loadCameraParamsText(const string& filename) {
+    // Path folder asset Anda
+    string path = "parameter_camera/" + filename;
+    ifstream file(path);
+    
+    if (!file.is_open()) {
+        cout << "[WARN] File " << filename << " tidak ditemukan. Menggunakan default." << endl;
+        return;
+    }
+
+    string line, key;
+    while (getline(file, line)) {
+        stringstream ss(line);
+        ss >> key;
+        if (key == "PARA") {
+            for (int i = 0; i < 6; i++) ss >> PARA[i];
+        } 
+        else if (key == "ORG_W")   ss >> ORG_W;
+        else if (key == "ORG_H")   ss >> ORG_H;
+        else if (key == "ORG_ICX") ss >> ORG_ICX;
+        else if (key == "ORG_ICY") ss >> ORG_ICY;
+    }
+    file.close();
+    cout << "[CONFIG] Parameters loaded dari: " << filename << endl;
+}
 
 // State
 enum ViewMode { MODE_MAIN, MODE_ORIGINAL, MODE_PANORAMA, MODE_GRID, MODE_SINGLE, MODE_TRIPLE };
@@ -96,6 +124,8 @@ atomic<double> stats_remap_ms(0.0);
 atomic<double> stats_draw_ms(0.0);   
 atomic<double> stats_fps(0.0);     
 atomic<double> stats_map_ms(0.0); 
+atomic<double> stats_gui_ms(0.0);    // GTK/GDK Rendering
+atomic<double> stats_flush_ms(0.0);  // DMA Buffer Sync
 
 // Buffers
 // BUFFER_SIZE = 3 untuk Double buffering yang aman
@@ -740,7 +770,7 @@ void captureThread(string src) {
         pipe = "v4l2src device=/dev/video" + src +
                " ! image/jpeg, width=" + to_string(IN_W) + 
                ", height=" + to_string(IN_H) + 
-               // ", framerate=30/1" <--- INI BIANG KEROKNYA (HAPUS/KOMENTARI)
+               ", framerate=30/1" 
                " ! jpegdec"                 
                " ! videoconvert"            
                " ! video/x-raw, format=YUY2"
@@ -818,7 +848,8 @@ void drawDetectionsOnInput(Mat &img, const vector<detection>& dets) {
 void drawInfoBox(Mat &img) {}
 
 gboolean update_gui_image(gpointer user_data)
-{
+{   
+    auto t_gui_start = chrono::steady_clock::now();
     int idx = (int)(intptr_t)user_data;
     if (idx < 0 || idx >= BUFFER_SIZE) {
         ui_update_pending = false;
@@ -921,6 +952,11 @@ gboolean update_gui_image(gpointer user_data)
 
     outputPool[idx].ready = false;
     ui_update_pending = false;
+
+    auto t_gui_end = chrono::steady_clock::now(); // <--- END TIMER
+    std::chrono::duration<double, std::milli> ms_gui = t_gui_end - t_gui_start;
+    stats_gui_ms.store(ms_gui.count());
+
     return FALSE;
 }
 
@@ -959,25 +995,26 @@ void pipelineThread() {
         AiStats ai_stats;
         vector<detection> results;
         
-        // === 1. Convert YUYV -> BGR (KOTAK MERAH 2) ===
         auto t_cvt_start = chrono::steady_clock::now();
         
+        // A. Flush Input: Kirim data YUYV dari cache CPU ke RAM fisik agar terbaca DRP
+        buffer_flush_dmabuf(inputPool[idx_in].dbuf.idx, inputPool[idx_in].dbuf.size);
+        
+        // B. Execute: Menggunakan OpenCVA untuk konversi warna di hardware DRP
         cv::cvtColor(inputPool[idx_in].data, processPool[idx_in].data, COLOR_YUV2RGB_YUY2);
+        
+        // C. Flush Output: Pastikan hasil konversi di RAM terbaca kembali oleh AI & CPU
         buffer_flush_dmabuf(processPool[idx_in].dbuf.idx, processPool[idx_in].dbuf.size);
         
         auto t_cvt_end = chrono::steady_clock::now();
-        std::chrono::duration<double, std::milli> ms_cvt = t_cvt_end - t_cvt_start;
-        stats_cvt_ms.store(ms_cvt.count());
+        stats_cvt_ms.store(chrono::duration<double, std::milli>(t_cvt_end - t_cvt_start).count());
 
-        
-        // === 2. Run DRP-AI YOLO (KOTAK HIJAU 1) ===
+        // ==================================================================
+        // === STEP 2: RUN DRP-AI YOLO (HARDWARE AI)                      ===
+        // ==================================================================
         bool run_inference = true;
-        if (IS_CAMERA_MODE) {
-            if (ai_skip_counter % 5 != 0) run_inference = false;
-            ai_skip_counter++;
-        } else {
-            run_inference = true;
-        }
+        // Skip AI frame jika dalam mode kamera untuk menjaga stabilitas
+        if (IS_CAMERA_MODE && ai_skip_counter++ % 3 != 0) run_inference = false;
 
         if (run_inference) {
             results = yolo.run_detection(processPool[idx_in].data, ai_stats);
@@ -985,31 +1022,32 @@ void pipelineThread() {
             stats_ai_ms.store(ai_stats.total);
         } else {
             results = cached_results;
-            ai_stats.total = 0; 
         }
 
-        // === 3. Remap Fisheye (KOTAK HIJAU 2) ===
+        // ==================================================================
+        // === STEP 3: REMAP FISHEYE (DRP-HW DEWARPING)                   ===
+        // ==================================================================
         auto t_remap_start = chrono::steady_clock::now();
         if (maps_ready && !map1_bufs[map_idx].data.empty()) {
-            cv::remap(processPool[idx_in].data, outputPool[idx_out].data, map1_bufs[map_idx].data, map2_bufs[map_idx].data, INTER_NEAREST, BORDER_CONSTANT);
+            // Remap dilakukan secara otomatis oleh Hardware DRP jika map tersedia
+            cv::remap(processPool[idx_in].data, outputPool[idx_out].data, 
+                      map1_bufs[map_idx].data, map2_bufs[map_idx].data, 
+                      INTER_NEAREST, BORDER_CONSTANT);
         } else {
             processPool[idx_in].data.copyTo(outputPool[idx_out].data); 
         }
         auto t_remap_end = chrono::steady_clock::now();
-        std::chrono::duration<double, std::milli> ms_remap = t_remap_end - t_remap_start;
-        stats_remap_ms.store(ms_remap.count());
+        stats_remap_ms.store(chrono::duration<double, std::milli>(t_remap_end - t_remap_start).count());
 
-        
-        // === 4. Draw Boxes (KOTAK MERAH 3) ===
+        // ==================================================================
+        // === STEP 4: DRAW BOXES & POST-PROCESSING (CPU)                 ===
+        // ==================================================================
         auto t_draw_start = chrono::steady_clock::now();
         if (maps_ready && !map1_bufs[map_idx].data.empty()) {
             drawBBoxesOnOutput(outputPool[idx_out].data, map1_bufs[map_idx].data, results, current_mode.load());
         }
-        // (Opsional: Jika Anda mengaktifkan cvtColor BGR->RGB untuk display, masukkan ke sini juga)
-        
         auto t_draw_end = chrono::steady_clock::now();
-        std::chrono::duration<double, std::milli> ms_draw = t_draw_end - t_draw_start;
-        stats_draw_ms.store(ms_draw.count());
+        stats_draw_ms.store(chrono::duration<double, std::milli>(t_draw_end - t_draw_start).count());
 
 
         // --- FPS & LOGGING (FULL CALCULATION) ---
@@ -1032,35 +1070,51 @@ void pipelineThread() {
             }
 
             // --- PERHITUNGAN TOTAL SEMUA KOTAK ---
-            double t_read = stats_read_ms.load();
-            double t_cvt  = stats_cvt_ms.load();
-            double t_ai   = stats_ai_ms.load();
-            double t_remap= stats_remap_ms.load();
-            double t_draw = stats_draw_ms.load();
+            double t_read  = stats_read_ms.load();
+            double t_cvt   = stats_cvt_ms.load();
+            double t_ai    = stats_ai_ms.load();
+            double t_remap = stats_remap_ms.load();
+            double t_draw  = stats_draw_ms.load();
+            double t_gui   = stats_gui_ms.load();
+            double t_flush = stats_flush_ms.load();
 
-            double total_pipeline_latency = t_read + t_cvt + t_ai + t_remap + t_draw;
+            double total_active_latency = t_read + t_cvt + t_ai + t_remap + t_draw + t_gui + t_flush;
+            double total_interval = 1000.0 / current_fps;
+            double system_overhead = total_interval - total_active_latency;
+            if (system_overhead < 0) system_overhead = 0; // Proteksi jika FPS sangat tinggi
 
-            printf("\n=================[ FULL PERFORMANCE LOG ]=================\n");
+            printf("\n================[ ANALYZE PERFORMA & BOTTLENECK ]================\n");
             printf(" [GENERAL]\n");
             printf("  > Source    : %s\n", IS_CAMERA_MODE ? "Camera" : "Video File");
             printf("  > Mode      : %s\n", mode_name.c_str());
-            printf("  > FPS       : %d\n", (int)current_fps);
             printf("  > Input     : %dx%d\n", IN_W, IN_H);
             printf("  > Output    : %dx%d\n", OUT_W, OUT_H);
             printf(" ---------------------------------------------------------\n");
-            printf(" [LATENCY BREAKDOWN (RED + GREEN SCOPES)]\n");
-            printf("  1. Cam Read : %6.2f ms  [Red]\n", t_read);
-            printf("  2. CvtColor : %6.2f ms  [Red]\n", t_cvt);
-            printf("  3. YOLO AI  : %6.2f ms  [Green]\n", t_ai);
-            printf("  4. Remap    : %6.2f ms  [Green]\n", t_remap);
-            printf("  5. Drawing  : %6.2f ms  [Red]\n", t_draw);
-            printf("  --------------------------------------\n");
-            printf("  > GRAND TOTAL: %6.2f ms\n", total_pipeline_latency);
-            printf(" ---------------------------------------------------------\n");
+
+            printf(" [PROSES HARDWARE & AI]\n");
+            printf("  1. Gstreamer (Cam Read) : %6.2f ms\n", t_read);
+            printf("  2. DRP-AI (Inference)   : %6.2f ms\n", t_ai);
+            printf("  3. Remap (DRP-HW)       : %6.2f ms\n", t_remap);
+            printf("  4. Buffer Sync (Flush)  : %6.2f ms  -> (DMA Sync Time)\n", t_flush);
+            printf(" [PROSES SOFTWARE & GUI]\n");
+            printf("  5. CvtColor (CPU)       : %6.2f ms\n", t_cvt);
+            printf("  6. Draw Box (CPU)       : %6.2f ms\n", t_draw);
+            printf("  7. GUI Render (GTK)     : %6.2f ms  -> (Display Latency)\n", t_gui);
+            printf(" [SISTEM]\n");
+            printf("  8. System Overhead      : %6.2f ms  -> (Thread/Mutex Wait)\n", system_overhead);
+            printf("  ----------------------------------------------------------------\n");
+            printf("  > TOTAL PIPELINE LATENCY: %6.2f ms\n", total_active_latency + system_overhead);
+            printf("  > REAL THROUGHPUT       : %6.2f FPS\n", current_fps);
+            printf("==================================================================\n");
             fflush(stdout);
         }
 
+        auto t_flush_start = chrono::steady_clock::now();
+
         buffer_flush_dmabuf(outputPool[idx_out].dbuf.idx, outputPool[idx_out].dbuf.size);
+        auto t_flush_end = chrono::steady_clock::now();
+        std::chrono::duration<double, std::milli> ms_flush = t_flush_end - t_flush_start;
+        stats_flush_ms.store(ms_flush.count());
         { 
             lock_guard<mutex> lock(mtxData); 
             outputPool[idx_out].ready = true; 
@@ -1208,16 +1262,28 @@ extern "C" {
 
 int main(int argc, char** argv) {
     try {
+        
         signal(SIGINT, signal_handler);
         putenv((char*)"GST_DEBUG=*:0");
         moildev_app_get_resource();
         
-        if(argc < 2) { cout << "./app <file> <res_id (0-4)>" << endl; return -1; }
+        if(argc < 4) { 
+        cout << "Usage: ./app <source> <res_idx> <camera_param.txt>" << endl; 
+        return -1; 
+        }
+
+        loadCameraParamsText(argv[3]);
+
         if (argc >= 3) SEL_RES_IDX = atoi(argv[2]);
         if (SEL_RES_IDX < 0 || SEL_RES_IDX >= BENCHMARK_RES.size()) SEL_RES_IDX = 0;
         if(SEL_RES_IDX == 3) BUFFER_SIZE = 2; 
         
-        OUT_W = BENCHMARK_RES[SEL_RES_IDX].w; OUT_H = BENCHMARK_RES[SEL_RES_IDX].h;
+        OUT_W = BENCHMARK_RES[SEL_RES_IDX].w; 
+        OUT_H = BENCHMARK_RES[SEL_RES_IDX].h;
+        
+        initRhoLUT();
+
+        moildev_app_get_resource();
 
         string src_param = argv[1];
         if (!isdigit(src_param[0])) {
