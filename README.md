@@ -2,6 +2,13 @@
 
 A real-time fisheye camera dewarping and object detection application leveraging Renesas DRP-AI (Deep Learning Processing) hardware acceleration and MOIL (Multiscale Omnidirectional Image Layout) technology.
 
+## 📚 Documentation
+
+- **[Quick Start Guide](QUICKSTART.md)** - Get up and running in 15 minutes
+- **[Deployment Guide](DEPLOYMENT.md)** - Production deployment instructions
+- **[Contributing Guide](CONTRIBUTING.md)** - Development guidelines
+- **[This README](#)** - Comprehensive project documentation
+
 ## Features
 
 ### Core Capabilities
@@ -75,6 +82,9 @@ EOF
 ### 3. Build
 
 ```bash
+# Check dependencies (recommended)
+./check_deps.sh
+
 # Clean build
 ./build.sh
 
