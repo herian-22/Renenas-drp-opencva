@@ -1,0 +1,9 @@
+# Example YOLOv8 Class Labels
+# One class name per line
+# This file should match your trained model's classes
+
+person
+car
+bicycle
+motorcycle
+truck

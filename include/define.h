@@ -2,48 +2,75 @@
 
 #include <string>
 
-/* Model DRP-AI (Direktori tempat Anda meletakkan file .so, .json, .params) */
+/*****************************************
+ * YOLOv8 Model Configuration
+ * 
+ * Configure these settings to match your trained model.
+ * After changing these values, run a full rebuild.
+ ******************************************/
 
-const std::string model_dir = "unicornv8n"; // Nama folder model Anda
+/* Model DRP-AI (Directory containing deploy.so, deploy.json, deploy.params) */
+const std::string model_dir = "unicornv8n"; // Name of model folder
 
-/* File teks label (satu nama kelas per baris) */
-
+/* Label file (one class name per line, matching model's trained classes) */
 const std::string label_list = "unicornv8m.txt";
 
-/* Jumlah kelas yang dilatih model Anda */
+/* Number of object classes your model was trained to detect */
 #define NUM_CLASS (5) 
 
-/* Dimensi Input Model */
+/* Input dimensions expected by YOLOv8 model (typically 640x640) */
 #define MODEL_IN_W (640)
 #define MODEL_IN_H (640)
 
-/* Ambang batas (Thresholds) */
+/*****************************************
+ * Detection Thresholds
+ * 
+ * Adjust these to control detection sensitivity.
+ * Higher values = fewer but more confident detections.
+ ******************************************/
 
+/* Minimum confidence score to accept a detection (0.0 to 1.0) */
 #define TH_PROB (0.25f) 
+
+/* Non-Maximum Suppression (NMS) IoU threshold (0.0 to 1.0) */
 #define TH_NMS (0.45f)  
+  
 
 /*****************************************
-* Definisi Aplikasi Kamera & Tampilan
-******************************************/
+ * Camera & Display Configuration
+ * 
+ * These settings control input/output resolution.
+ * Lower input resolution = faster processing but less detail.
+ ******************************************/
 
-#define DRPAI_IN_WIDTH (640)  // Ubah dari 1280
-#define DRPAI_IN_HEIGHT (480) // Ubah dari 720
-#define IMAGE_OUTPUT_WIDTH (1280) // Display bisa tetap 1280x720
+/* DRP-AI input resolution (what gets sent to AI model) */
+#define DRPAI_IN_WIDTH (640)   // Reduced from 1280 for better performance
+#define DRPAI_IN_HEIGHT (480)  // Reduced from 720 for better performance
+
+/* Display output resolution (what user sees on screen) */
+#define IMAGE_OUTPUT_WIDTH (1280) 
 #define IMAGE_OUTPUT_HEIGHT (720)
 
-/* Pengaturan Kamera (GStreamer/OpenCV) */
+/* Camera capture settings */
 #define CAM_IMAGE_WIDTH (DRPAI_IN_WIDTH)
 #define CAM_IMAGE_HEIGHT (DRPAI_IN_HEIGHT)
-#define CAM_IMAGE_CHANNEL_BGR (3) 
-#define IMAGE_OUTPUT_CHANNEL_BGRA (4) 
+#define CAM_IMAGE_CHANNEL_BGR (3)   // BGR color format
+#define IMAGE_OUTPUT_CHANNEL_BGRA (4)  // BGRA for display
 #define IMAGE_CHANNEL_BGR (3) 
-#define CAPTURE_STABLE_COUNT (8) 
+#define CAPTURE_STABLE_COUNT (8)  // Frames to skip for camera stabilization
 
-/* Nama Input Kamera (Akan dideteksi otomatis, tapi ini sbg placeholder) */
+/* Default camera device */
 #define INPUT_CAM_NAME "/dev/video0"
+
+/* AI inference frequency: Run detection every N frames (2 = every other frame) */
 #define DRPAI_FREQ (2) 
 
-/* Pengaturan Teks & Kotak */
+/*****************************************
+ * UI Display Settings
+ * 
+ * Control appearance of text and bounding boxes
+ ******************************************/
+
 #define LINE_HEIGHT (30)
 #define LINE_HEIGHT_OFFSET (20)
 #define TEXT_WIDTH_OFFSET (10)
@@ -60,12 +87,16 @@ const std::string label_list = "unicornv8m.txt";
 #define ALIGHN_LEFT (1)
 #define ALIGHN_RIGHT (2)
 
+/* Color definitions (RGB hex format) */
 #define BLACK_DATA (0x000000u)
 #define WHITE_DATA (0xFFFFFFu)
 #define GREEN_DATA (0x00FF00u)
 
-/* Pengaturan Thread & Waktu */
-#define WAIT_TIME (1000) // 1ms
+/*****************************************
+ * Threading & Performance Settings
+ ******************************************/
+
+#define WAIT_TIME (1000)  // Microseconds (1ms)
 #define TIME_COEF (1.0)
 #define DISPLAY_THREAD_TIMEOUT (5)
 #define CAPTURE_TIMEOUT (5)
@@ -74,19 +105,28 @@ const std::string label_list = "unicornv8m.txt";
 #define DRPAI_TIMEOUT (5)
 #define IMAGE_THREAD_TIMEOUT (5)
 
-/* Makro Helper */
+/* Helper macros */
 #define SIZE_OF_ARRAY(array) (sizeof(array) / sizeof(array[0]))
+
+/* Bounding box colors (RGB hex format) */
 #define NUM_BOX_COLORS 3
 static uint32_t box_color[] =
 {
-    0xFF0000u, // Merah 
-    0x00FF00u, // Hijau
-    0x0000FFu, // Biru
+    0xFF0000u,  // Red
+    0x00FF00u,  // Green
+    0x0000FFu,  // Blue
 };
 
+/* Debug/Display Flags */
+#define DEBUG_TIME_FLG          // Enable timing measurements
+#define DISP_CAM_FRAME_RATE     // Show FPS counter
+
 /*****************************************
-* Definisi Internal YOLOv8 (Dari file lama Anda)
-******************************************/
+ * YOLOv8 Internal Architecture Parameters
+ * 
+ * DO NOT MODIFY unless you know what you're doing.
+ * These must match the YOLOv8 model architecture.
+ ******************************************/
 #define STRIDE_0 (8)
 #define STRIDE_1 (16)
 #define STRIDE_2 (32)

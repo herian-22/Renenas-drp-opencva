@@ -1,0 +1,9 @@
+# Saved View Configuration
+# This file is auto-generated when pressing 'S' key
+# Format: <MODE> <alpha> <beta> <zoom> <flip_h> <flip_v>
+
+VIEW1 -45.0 0.0 3.5 0 0
+VIEW2 0.0 0.0 3.5 0 0
+VIEW3 45.0 0.0 3.5 0 0
+PANO 110.0 0.0 1.0 0 0
+SINGLE 0.0 0.0 2.0 0 0
