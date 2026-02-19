@@ -1,15 +1,63 @@
-build
-exe-moilcvdrp
-exe-moilcvdrp/moildev_app1
-unicorn_model
-yolov8ntvmcup
+# Build artifacts
+build/
+*.o
+*.a
+*.so
+*.so.*
+
+# Executable
+exe-moilcvdrp/
+moildev_app+DrpAiYolo
+moildev_app
+
+# Model directories (user should add their own)
+unicorn_model/
+yolov8ntvmcup/
+object-detection/
+unicorn_baru/
+unicornv8m/
+unicornv8n/
+
+# Model files
+*.params
+*.json
+deploy.so
+
+# Sample data
+sample_footage/
 sample_footage.zip
-log
-exe-moilcvdrp
-sample_footage
+*.mp4
+*.avi
+*.mkv
+
+# Configuration and log files
+moildev_config.txt
+log/
+*.log
+
+# Temporary files
+*.txt~
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# GTK/GResource generated files
+asset/moildev_resources.c
+asset/moildev_resources.h
+moildev_resources.c
+moildev_resources.h
+
+# Backup files
 asset/gui copy.glade
-object-detection
-unicornv8m
-asset/yolov8n_pano
-unicorn_baru
+*.bak
+*.backup
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# User-specific model labels
 unicornv8m.txt
+labels.txt

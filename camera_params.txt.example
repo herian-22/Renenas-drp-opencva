@@ -1,0 +1,19 @@
+# Example Camera Parameters for MOIL Fisheye Dewarping
+# Save this file to: asset/parameter_camera/custom.txt
+
+# Polynomial coefficients for radial distortion correction
+# PARA p0 p1 p2 p3 p4 p5
+PARA 0.0 0.0 -35.475 73.455 -41.392 499.33
+
+# Original image dimensions
+ORG_W 2592.0
+ORG_H 1944.0
+
+# Optical center coordinates (image center point)
+ORG_ICX 1296.0
+ORG_ICY 972.0
+
+# How to obtain these values:
+# 1. Use MOIL calibration software with checkerboard pattern
+# 2. Or contact your fisheye camera manufacturer for parameters
+# 3. Adjust ORG_ICX and ORG_ICY if optical center is not at image center
