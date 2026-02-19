@@ -117,9 +117,23 @@ static uint32_t box_color[] =
     0x0000FFu,  // Blue
 };
 
-/* Debug/Display Flags */
-#define DEBUG_TIME_FLG          // Enable timing measurements
-#define DISP_CAM_FRAME_RATE     // Show FPS counter
+/*****************************************
+ * Debug and Display Flags
+ * 
+ * These flags control diagnostic output and performance monitoring.
+ * Minimal performance impact when enabled.
+ ******************************************/
+
+/* Enable detailed timing measurements for all processing stages.
+ * When enabled, prints breakdown of processing times to console:
+ * - Frame read time, remap time, AI inference time
+ * Overhead: ~0.1ms per frame */
+#define DEBUG_TIME_FLG
+
+/* Display real-time FPS counter on screen.
+ * Shows camera capture FPS in the GUI overlay.
+ * Overhead: negligible */
+#define DISP_CAM_FRAME_RATE
 
 /*****************************************
  * YOLOv8 Internal Architecture Parameters

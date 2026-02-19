@@ -14,8 +14,8 @@ Thank you for your interest in contributing! This document provides guidelines f
 
 ```bash
 # Clone the repository
-git clone https://github.com/herian-22/Renenas-drp-opencva.git
-cd Renenas-drp-opencva
+git clone https://github.com/herian-22/Renesas-drp-opencva.git
+cd Renesas-drp-opencva
 
 # Source the SDK
 source /opt/poky/3.1.31/environment-setup-aarch64-poky-linux
