@@ -962,6 +962,12 @@ gboolean update_gui_image(gpointer user_data)
 
 
 
+// === DRP-AI DETECTION + RENDERING PIPELINE ===
+// Main processing loop:
+// 1. Get captured frame from queue
+// 2. Apply fisheye dewarping using pre-computed maps
+// 3. Run YOLOv8 detection every DRPAI_FREQ frames
+// 4. Render results and update GTK display
 void pipelineThread() {
     int frame_count = 0; 
     auto last_fps_time = chrono::steady_clock::now();
