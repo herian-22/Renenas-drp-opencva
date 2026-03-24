@@ -1,4 +1,4 @@
-# Renenas DRP-OAI + Moildev (OpenCVA)
+# Renesas DRP-AI + Moildev (OpenCVA)
 
 Dokumentasi ini merangkum seluruh fungsi penting, rumus yang dipakai, serta cara build dan menjalankan aplikasi pendeteksi objek berbasis DRP-AI YOLO dengan dukungan koreksi fisheye Moildev dan akselerasi OpenCV Accelerator (OCA) di SoC Renesas RZ/V2H.
 
@@ -35,7 +35,7 @@ export TVM_HOME=/path/to/tvm
 export SDK=/path/to/sdk              # diperlukan agar deteksi V2H/V2N berjalan
 export SDKTARGETSYSROOT=/path/to/sysroot
 
-cd /home/runner/work/Renenas-drp-opencva/Renenas-drp-opencva
+cd /home/runner/work/Renesas-drp-opencva/Renesas-drp-opencva
 ./build.sh
 ```
 Hasil binaan: `build/moildev_app+DrpAiYolo`.
